@@ -44,7 +44,7 @@ foreach(script IN LISTS SCRIPTS)
   if(EXISTS ${ARGPARSE_MANPAGE_PATH})
     add_custom_command(
       OUTPUT ${man}
-      COMMAND ${ARGPARSE_MANPAGE_PATH} --pyfile "${dst}" --function "argparse_get_parser" --author "Tarick Bedeir" --author-email "tarick@bedeir.com" --project-name "sasl-xoauth2" --url "https://github.com/tarickb/sasl-xoauth2" > "${man}"
+      COMMAND ${ARGPARSE_MANPAGE_PATH} --pyfile "${dst}" --function "argparse_get_parser" --author "Tarick Bedeir" --author-email "tarick@bedeir.com" --project-name "sasl-xoauth2" --url "https://github.com/LMS235/sasl-xoauth2" > "${man}"
       DEPENDS ${dst}
       COMMENT "Generating man page for ${script}"
       VERBATIM)
