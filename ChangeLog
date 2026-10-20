@@ -1,3 +1,31 @@
+sasl-xoauth2 (0.29) unstable; urgency=medium
+
+  * Security: keep token file permissions when updating it (updated token
+    files used to be created according to the umask, i.e. world-readable),
+    write it atomically and durably, and never replace it with a partial file.
+  * Security: URL-encode token request parameters, only send token requests
+    over HTTPS, do not follow redirects, require TLS 1.2, bound response size.
+  * Security: reject user names and tokens containing control characters.
+  * Security (tool): create token files readable by their owner only, bind the
+    Gmail listener to 127.0.0.1, use state and PKCE for authorization codes.
+  * Fix refresh_window from the config file being ignored (and "0" being
+    written into every token file); default refresh window is now 300s.
+  * Serialize token refreshes between processes with a lock file, and reuse a
+    token another process has just obtained.
+  * Add timeouts to token requests.
+  * Add grant_type/scope options and support for the client credentials
+    (app-only) flow, e.g. Microsoft 365 with SMTP.SendAsApp; the tool gains
+    --client-credentials and --mailbox.
+  * Do not send an empty client_secret; send scope if configured.
+  * Log the provider's error and a hint when a token request fails.
+  * Tool: write to stdout for '-', show Entra ID error details, write real
+    token expiry, no longer request the unneeded openid scope.
+  * CA certificate script removes certificates no longer present on the
+    system and copies symlink targets.
+  * Never terminate the host process from within the plugin.
+
+ -- Florian Lamml <florian.lamml@contis.de>  Tue, 20 Oct 2026 15:00:00 +0200
+
 sasl-xoauth2 (0.28) unstable; urgency=low
 
   * Fix CURL handle use-after-free (thanks @dechamps).

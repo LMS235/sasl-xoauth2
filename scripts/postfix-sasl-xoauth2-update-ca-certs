@@ -7,5 +7,23 @@ if [ ! -d /var/spool/postfix ]; then
     exit 0
 fi
 
-mkdir -p /var/spool/postfix/etc/ssl
-cp -r /etc/ssl/certs /var/spool/postfix/etc/ssl/
+dest=/var/spool/postfix/etc/ssl
+mkdir -p "$dest"
+
+# Build the new copy next to the old one, then swap it in, so that the chroot
+# never sees a half-copied directory and certificates removed from the system
+# (e.g. distrusted CAs) disappear from the chroot as well.
+tmp=$(mktemp -d "$dest/.certs.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+# -L: /etc/ssl/certs is mostly symlinks into /usr/share/ca-certificates, which
+# does not exist inside the chroot; copy what they point to.
+cp -RL /etc/ssl/certs/. "$tmp/"
+chmod 755 "$tmp"
+
+rm -rf "$dest/certs.old"
+if [ -e "$dest/certs" ]; then
+    mv "$dest/certs" "$dest/certs.old"
+fi
+mv "$tmp" "$dest/certs"
+rm -rf "$dest/certs.old"

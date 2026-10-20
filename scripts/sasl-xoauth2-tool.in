@@ -3,14 +3,21 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import base64
+import getpass
+import hashlib
 import http
 import http.server
 import json
 import logging
-import msal
 import os
+import secrets
+import stat
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -39,39 +46,104 @@ def url_safe_escape(instring:str) -> str:
     return urllib.parse.quote(instring, safe='~-._')
 
 
+def pkce_pair() -> Dict[str,str]:
+    """Returns a PKCE (RFC 7636) code verifier and its S256 challenge."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode('ascii')).digest()).decode('ascii').rstrip('=')
+    return {'verifier': verifier, 'challenge': challenge}
+
+
+def expiry_from_response(response:Dict[str,Any]) -> int:
+    """Absolute expiry for a token response, or 0 (refresh on first use)."""
+    try:
+        return int(time.time()) + int(response['expires_in'])
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+
+def post_token_request(url:str, params:Dict[str,str]) -> Dict[str,Any]:
+    """POSTs a token request; raises with the provider's reason on failure."""
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(params).encode('ascii'),
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        try:
+            error = json.loads(body)
+            reason = f"{error.get('error')}: {error.get('error_description')}"
+        except ValueError:
+            reason = body
+        raise Exception(f"Token request to {url} failed with HTTP {e.code}: {reason}") from None
+
+
 def dump_overwrite(token:dict, output_filename:str, input_dict:dict):
     # overwrite fields in previous token (represented by input_dict)
     # that also have values from new token
     input_dict.update(token)
-    with open(output_filename,'w') as output_file:
-        json.dump(input_dict, output_file, indent=4)
+    if output_filename == '-':
+        json.dump(input_dict, sys.stdout, indent=4)
+        print()
+        return
+    # The token file holds secrets: create it readable by its owner only (or
+    # keep the owner/group bits of the file it replaces), and replace it
+    # atomically so a failure never leaves a truncated token file behind.
+    mode = 0o600
+    try:
+        mode |= stat.S_IMODE(os.stat(output_filename).st_mode) & 0o770
+    except FileNotFoundError:
+        pass
+    directory = os.path.dirname(os.path.abspath(output_filename))
+    fd, temp_path = tempfile.mkstemp(dir=directory, prefix='.sasl-xoauth2-')
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as output_file:
+            json.dump(input_dict, output_file, indent=4)
+            output_file.write('\n')
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temp_path, output_filename)
+    except BaseException:
+        os.unlink(temp_path)
+        raise
 
 
 def gmail_redirect_uri(local_port:int) -> str:
     return 'http://127.0.0.1:%d%s' % (local_port, GOOGLE_OAUTH2_RESULT_PATH)
 
 
-def gmail_get_auth_url(client_id:str, scope:str, local_port:int) -> str:
-    client_id = url_safe_escape(client_id)
-    scope = url_safe_escape(scope)
-    redirect_uri = url_safe_escape(gmail_redirect_uri(local_port))
-    return '{}?client_id={}&scope={}&response_type={}&redirect_uri={}'.format(
-        GOOGLE_OAUTH2_AUTH_URL, client_id, scope, 'code', redirect_uri)
+def gmail_get_auth_url(client_id:str, scope:str, local_port:int, state:str, code_challenge:str) -> str:
+    query = {
+        'client_id': client_id,
+        'scope': scope,
+        'response_type': 'code',
+        'redirect_uri': gmail_redirect_uri(local_port),
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'state': state,
+        'code_challenge': code_challenge,
+        'code_challenge_method': 'S256',
+    }
+    return f"{GOOGLE_OAUTH2_AUTH_URL}?{urllib.parse.urlencode(query, quote_via=urllib.parse.quote)}"
 
 
-def gmail_get_token_from_code(client_id:str, client_secret:str, authorization_code:str, local_port:int) -> Any:
+def gmail_get_token_from_code(client_id:str, client_secret:str, authorization_code:str, local_port:int, code_verifier:str) -> Any:
     params = {}
     params['client_id'] = client_id
     params['client_secret'] = client_secret
     params['code'] = authorization_code
+    params['code_verifier'] = code_verifier
     params['redirect_uri'] = gmail_redirect_uri(local_port)
     params['grant_type'] = 'authorization_code'
-    data = urllib.parse.urlencode(params)
-    response = urllib.request.urlopen(GOOGLE_OAUTH2_TOKEN_URL, data.encode('ascii')).read()
-    return json.loads(response)
+    return post_token_request(GOOGLE_OAUTH2_TOKEN_URL, params)
 
 
-def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:str, forward_url:str, input_dict:dict) -> type:
+def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:str, forward_url:str, input_dict:dict, state:str, code_verifier:str) -> type:
     class GMailRequestHandler(http.server.BaseHTTPRequestHandler):
         def log_request(self, code:Union[int,str]='-', size:Union[int,str]='-') -> None:
             # Silence request logging.
@@ -94,6 +166,12 @@ def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:s
 
         def handle_google_response(self, parse:urllib.parse.ParseResult) -> None:
             qs = urllib.parse.parse_qs(parse.query)
+            # Reject responses not caused by our own authorization request.
+            if qs.get('state') != [state]:
+                print("Ignoring response with missing or mismatched state.", file=sys.stderr)
+                self.send_response(400)
+                self.end_headers()
+                return
             if 'code' not in qs:
                 print(f"Invalid query string in response '{qs}'", file=sys.stderr)
                 return
@@ -120,7 +198,12 @@ def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:s
                     client_secret,
                     code,
                     self.server.server_address[1],
+                    code_verifier,
                 )
+                if 'refresh_token' not in token:
+                    print("Response contains no refresh token.", file=sys.stderr)
+                    os._exit(1)
+                token['expiry'] = expiry_from_response(token)
                 dump_overwrite(token, output_filename, input_dict)
                 print(f"Wrote token to {output_filename}.", file=sys.stderr)
                 os._exit(0)
@@ -128,18 +211,23 @@ def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:s
     return GMailRequestHandler
 
 
-def get_token_gmail(client_id:str, client_secret:str, scope:str, output_filename:str, local_listen_port:int, input_dict:dict) -> None:
-    forward_url = gmail_get_auth_url(client_id, scope, local_listen_port)
+def get_token_gmail(client_id:str, client_secret:str, scope:str, output_filename:str, local_listen_port:int, local_listen_address:str, input_dict:dict) -> None:
+    state = secrets.token_urlsafe(32)
+    pkce = pkce_pair()
+    forward_url = gmail_get_auth_url(client_id, scope, local_listen_port, state, pkce['challenge'])
     request_handler_class = gmail_get_RequestHandler(
         client_id,
         client_secret,
         output_filename,
         forward_url,
         input_dict,
+        state,
+        pkce['verifier'],
     )
-    server = http.server.ThreadingHTTPServer(('', local_listen_port), request_handler_class)
+    # Only reachable from this host by default (or through an SSH tunnel).
+    server = http.server.ThreadingHTTPServer((local_listen_address, local_listen_port), request_handler_class)
 
-    url = f'http://localhost:{local_listen_port}/auth'
+    url = f'http://127.0.0.1:{local_listen_port}/auth'
     print(f"Please open this URL in a browser ON THIS HOST (or that has port {local_listen_port} forwarded to this host):\n\n{url}\n", file=sys.stderr)
 
     server.serve_forever()
@@ -148,23 +236,28 @@ def get_token_gmail(client_id:str, client_secret:str, scope:str, output_filename
 
 
 # Predefined cloud configurations for Microsoft 365 national clouds.
-# Each entry maps a cloud name to its login base URL and SMTP scope.
+# Each entry maps a cloud name to its login base URL, its delegated SMTP scope
+# and its app-only (client credentials) scope.
 OUTLOOK_CLOUD_CONFIGS = {
     "public": {
         "login_base": "https://login.microsoftonline.com",
-        "scope": "openid offline_access https://outlook.office.com/SMTP.Send",
+        "app_scope": "https://outlook.office365.com/.default",
+        "scope": "offline_access https://outlook.office.com/SMTP.Send",
     },
     "usgov": {
         "login_base": "https://login.microsoftonline.us",
-        "scope": "openid offline_access https://outlook.office365.us/SMTP.Send",
+        "app_scope": "https://outlook.office365.us/.default",
+        "scope": "offline_access https://outlook.office365.us/SMTP.Send",
     },
     "usgov-dod": {
         "login_base": "https://login.microsoftonline.us",
-        "scope": "openid offline_access https://outlook.office365.us/SMTP.Send",
+        "app_scope": "https://outlook.office365.us/.default",
+        "scope": "offline_access https://outlook.office365.us/SMTP.Send",
     },
     "china": {
         "login_base": "https://login.partner.microsoftonline.cn",
-        "scope": "openid offline_access https://partner.outlook.cn/SMTP.Send",
+        "app_scope": "https://partner.outlook.cn/.default",
+        "scope": "offline_access https://partner.outlook.cn/SMTP.Send",
     },
 }
 
@@ -186,7 +279,11 @@ def outlook_get_cloud_config(cloud:str, login_base_override:Optional[str], scope
     return config
 
 
-def outlook_get_authorization_code(client_id:str, tenant:str, cloud_config:Dict[str,str]) -> str:
+def outlook_token_endpoint(tenant:str, cloud_config:Dict[str,str]) -> str:
+    return f"{cloud_config['login_base']}/{tenant}/oauth2/v2.0/token"
+
+
+def outlook_get_authorization_code(client_id:str, tenant:str, cloud_config:Dict[str,str], state:str, code_challenge:str) -> str:
     login_base = cloud_config["login_base"]
     scope = cloud_config["scope"]
     redirect_uri = f"{login_base}/common/oauth2/nativeclient"
@@ -197,6 +294,9 @@ def outlook_get_authorization_code(client_id:str, tenant:str, cloud_config:Dict[
     query['redirect_uri'] = redirect_uri
     query['response_mode'] = 'query'
     query['scope'] = scope
+    query['state'] = state
+    query['code_challenge'] = code_challenge
+    query['code_challenge_method'] = 'S256'
 
     print("Please visit the following link in a web browser, then paste the resulting URL:\n\n" +
           f"{url}?{urllib.parse.urlencode(query)}\n",
@@ -207,70 +307,115 @@ def outlook_get_authorization_code(client_id:str, tenant:str, cloud_config:Dict[
         raise Exception(f"Resulting URL does not contain expected prefix: {redirect_uri}")
     resulting_url = urllib.parse.urlparse(resulting_url_input)
     code = urllib.parse.parse_qs(resulting_url.query)
+    if "error" in code:
+        raise Exception(f"Authorization failed: {code['error'][0]}: {code.get('error_description', [''])[0]}")
+    if code.get("state") != [state]:
+        raise Exception("Resulting URL has a missing or mismatched state; was it produced by this request?")
     if "code" not in code:
-        raise Exception(f"Missing code in result: {resulting_url.query}")
+        raise Exception("Missing code in resulting URL.")
     return code["code"][0]
 
 
-def outlook_get_initial_tokens(client_id:str, client_secret:str, tenant:str, code:str, cloud_config:Dict[str,str]) -> Dict[str,Union[str,int]]:
+def outlook_get_initial_tokens(client_id:str, client_secret:Optional[str], tenant:str, code:str, cloud_config:Dict[str,str], code_verifier:str) -> Dict[str,Union[str,int]]:
     login_base = cloud_config["login_base"]
     scope = cloud_config["scope"]
     redirect_uri = f"{login_base}/common/oauth2/nativeclient"
-    url = f"{login_base}/{tenant}/oauth2/v2.0/token"
     token_request:Dict[str,str] = {}
     token_request['client_id'] = client_id
-    if len(client_secret) > 0:
+    if client_secret:
       token_request['client_secret'] = client_secret
     token_request['scope'] = scope
     token_request['code'] = code
+    token_request['code_verifier'] = code_verifier
     token_request['redirect_uri'] = redirect_uri
     token_request['grant_type'] = 'authorization_code'
-    resp = urllib.request.urlopen(
-        urllib.request.Request(
-            url,
-            data=urllib.parse.urlencode(token_request).encode('ascii'),
-            headers={ "Content-Type": "application/x-www-form-urlencoded" }))
-    if resp.code != 200:
-        raise Exception(f"Request failed: {resp.code}")
-    try:
-        content = json.load(resp)
-        return {
-            'access_token': content["access_token"],
-            'refresh_token': content["refresh_token"],
-            'expiry': 0,
-        }
-    except:
-        raise Exception(f"Tokens not found in response: {content}")
-
-
-def outlook_get_initial_tokens_by_device_flow(client_id:str, tenant:str, cloud_config:Dict[str,str]) -> Dict[str,Union[str,int]]:
-    login_base = cloud_config["login_base"]
-    scope = cloud_config["scope"]
-    authority = f"{login_base}/{tenant}"
-    app = msal.PublicClientApplication(client_id, authority=authority)
-    flow = app.initiate_device_flow([scope])
-    if "user_code" not in flow:
-        raise Exception("Failed to create device flow. Ensure that public client flows are enabled for the application. Flow: %s" % json.dumps(flow, indent=4))
-    print(flow["message"])
-    sys.stdout.flush()
-    result = app.acquire_token_by_device_flow(flow)
-    if "access_token" not in result or "refresh_token" not in result:
-        raise Exception("Failed to acquire token. Result: %s" % json.dumps(result, indent=4))
-    print("Acquired token.")
+    content = post_token_request(outlook_token_endpoint(tenant, cloud_config), token_request)
+    if "access_token" not in content or "refresh_token" not in content:
+        raise Exception(f"Tokens not found in response (fields: {', '.join(sorted(content.keys()))}). "
+                        "Is 'offline_access' part of the scope?")
     return {
-        'access_token': result["access_token"],
-        'refresh_token': result["refresh_token"],
-        'expiry': 0,
+        'access_token': content["access_token"],
+        'refresh_token': content["refresh_token"],
+        'expiry': expiry_from_response(content),
     }
 
 
-def get_token_outlook(client_id:str, client_secret:str, tenant:str, use_device_flow:bool, output_filename:str, input_dict:dict, cloud_config:Dict[str,str]) -> None:
-    if use_device_flow:
+# MSAL always requests these itself and rejects them in a scope list.
+MSAL_RESERVED_SCOPES = {"openid", "profile", "offline_access"}
+
+
+def outlook_get_initial_tokens_by_device_flow(client_id:str, tenant:str, cloud_config:Dict[str,str]) -> Dict[str,Union[str,int]]:
+    import msal  # Only needed for this flow.
+    login_base = cloud_config["login_base"]
+    scopes = [s for s in cloud_config["scope"].split() if s not in MSAL_RESERVED_SCOPES]
+    authority = f"{login_base}/{tenant}"
+    app = msal.PublicClientApplication(client_id, authority=authority)
+    flow = app.initiate_device_flow(scopes)
+    if "user_code" not in flow:
+        raise Exception("Failed to create device flow. Ensure that public client flows are enabled for the application. Flow: %s" % json.dumps(flow, indent=4))
+    print(flow["message"], file=sys.stderr)
+    sys.stderr.flush()
+    result = app.acquire_token_by_device_flow(flow)
+    if "access_token" not in result or "refresh_token" not in result:
+        raise Exception("Failed to acquire token: %s: %s" % (result.get("error"), result.get("error_description")))
+    print("Acquired token.", file=sys.stderr)
+    return {
+        'access_token': result["access_token"],
+        'refresh_token': result["refresh_token"],
+        'expiry': expiry_from_response(result),
+    }
+
+
+def outlook_get_token_by_client_credentials(client_id:str, client_secret:str, tenant:str, cloud_config:Dict[str,str], mailbox:Optional[str]) -> Dict[str,Union[str,int]]:
+    """App-only access (no user sign-in, no refresh token).
+
+    Needs an application permission (e.g. SMTP.SendAsApp, or
+    IMAP.AccessAsApp/POP.AccessAsApp) with admin consent, and the app's service
+    principal registered in Exchange Online with access to the mailbox."""
+    token_endpoint = outlook_token_endpoint(tenant, cloud_config)
+    scope = cloud_config["app_scope"]
+    content = post_token_request(token_endpoint, {
+        'grant_type': 'client_credentials',
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'scope': scope,
+    })
+    if "access_token" not in content:
+        raise Exception(f"No access token in response (fields: {', '.join(sorted(content.keys()))}).")
+    print("Acquired app-only token.", file=sys.stderr)
+    # The plugin requests new tokens itself, so it needs everything a request
+    # takes; the file is created readable by its owner only.
+    tokens:Dict[str,Union[str,int]] = {
+        'grant_type': 'client_credentials',
+        'scope': scope,
+        'token_endpoint': token_endpoint,
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'access_token': content["access_token"],
+        'expiry': expiry_from_response(content),
+    }
+    if mailbox:
+        tokens['user'] = mailbox
+    return tokens
+
+
+def get_token_outlook(client_id:str, client_secret:Optional[str], tenant:str, flow:str, output_filename:str, input_dict:dict, cloud_config:Dict[str,str], mailbox:Optional[str]) -> None:
+    if flow == 'client-credentials':
+        if not client_secret:
+            raise Exception("The client credentials flow requires a client secret.")
+        tokens = outlook_get_token_by_client_credentials(client_id, client_secret, tenant, cloud_config, mailbox)
+    elif flow == 'device':
         tokens = outlook_get_initial_tokens_by_device_flow(client_id, tenant, cloud_config)
     else:
-        code = outlook_get_authorization_code(client_id, tenant, cloud_config)
-        tokens = outlook_get_initial_tokens(client_id, client_secret, tenant, code, cloud_config)
+        state = secrets.token_urlsafe(32)
+        pkce = pkce_pair()
+        code = outlook_get_authorization_code(client_id, tenant, cloud_config, state, pkce['challenge'])
+        tokens = outlook_get_initial_tokens(client_id, client_secret, tenant, code, cloud_config, pkce['verifier'])
+    if mailbox and 'user' not in tokens:
+        tokens['user'] = mailbox
     dump_overwrite(tokens, output_filename, input_dict)
+    if output_filename != '-':
+        print(f"Wrote token to {output_filename}.", file=sys.stderr)
 
 ##########
 
@@ -285,6 +430,8 @@ def argparse_get_parser() -> argparse.ArgumentParser:
 
 def subcommand_get_token(args:argparse.Namespace) -> None:
     input_dict = {}
+    if args.overwrite_existing_token and args.output_file == '-':
+        parser.error("--overwrite-existing-token needs an output file.")
     if args.overwrite_existing_token:
         if not os.path.isfile(args.output_file):
             raise Exception("Cannot overwrite nonexistent token file {}".format(args.output_file))
@@ -294,24 +441,34 @@ def subcommand_get_token(args:argparse.Namespace) -> None:
     if args.service == 'outlook':
         if not args.tenant:
             parser.error("'outlook' service requires 'tenant' argument.")
-        if not (args.client_secret or str(args.client_secret) == '') and not args.use_device_flow:
-            args.client_secret = input('Please enter OAuth2 client secret (not always required; Azure docs are unclear): ')
+        if args.use_device_flow and args.client_credentials:
+            parser.error("--use-device-flow and --client-credentials are mutually exclusive.")
+        flow = 'client-credentials' if args.client_credentials else ('device' if args.use_device_flow else 'auth-code')
+        if flow == 'client-credentials' and args.tenant in ('consumers', 'common', 'organizations'):
+            parser.error("--client-credentials requires --tenant=TENANT_ID (or the tenant's domain).")
+        if args.client_secret is None and flow != 'device':
+            prompt = ('Please enter OAuth2 client secret: ' if flow == 'client-credentials' else
+                      'Please enter OAuth2 client secret (leave empty for public clients): ')
+            args.client_secret = getpass.getpass(prompt)
         cloud_config = outlook_get_cloud_config(args.cloud, args.login_base, args.scope)
+        if args.scope and flow == 'client-credentials':
+            cloud_config["app_scope"] = args.scope
         get_token_outlook(
             args.client_id,
             args.client_secret,
             args.tenant,
-            args.use_device_flow,
+            flow,
             args.output_file,
             input_dict,
             cloud_config,
+            args.mailbox,
         )
     elif args.service == 'gmail':
         if args.cloud != 'public' or args.login_base:
             print("Warning: --cloud and --login-base are only used with the 'outlook' service and will be ignored.",
                   file=sys.stderr)
         if not args.client_secret:
-            args.client_secret = input('Please enter OAuth2 client secret: ')
+            args.client_secret = getpass.getpass('Please enter OAuth2 client secret: ')
         if not args.client_secret:
             parser.error("'gmail' service requires 'client-secret' argument.")
         if not args.scope:
@@ -322,6 +479,7 @@ def subcommand_get_token(args:argparse.Namespace) -> None:
             args.scope,
             args.output_file,
             args.local_listen_port,
+            args.local_listen_address,
             input_dict,
         )
 
@@ -342,13 +500,27 @@ sp_get_token.add_argument(
 )
 sp_get_token.add_argument(
     '--client-secret',
-    help="required for both services, will prompt the user if blank",
+    help="required for 'gmail' and for --client-credentials, optional for "
+         "other 'outlook' flows; will prompt the user if not given",
 )
 sp_get_token.add_argument(
     "--use-device-flow",
     default=False,
     action='store_true',
     help="use simplified device flow for Outlook/Azure",
+)
+sp_get_token.add_argument(
+    "--client-credentials",
+    default=False,
+    action='store_true',
+    help="use the app-only client credentials flow for Outlook/Azure (no user "
+         "sign-in, no refresh token); requires --tenant=TENANT_ID and a client secret",
+)
+sp_get_token.add_argument(
+    '--mailbox',
+    help="mailbox (email address) to authenticate as; stored as 'user' in the "
+         "token file. Required by --client-credentials unless Postfix's "
+         "sasl_passwd user name already is the mailbox address.",
 )
 sp_get_token.add_argument(
     '--cloud', default='public',
@@ -366,7 +538,8 @@ sp_get_token.add_argument(
     '--scope',
     help="for 'gmail': required OAuth2 scope. "
          "For 'outlook': override the default scope from --cloud "
-         "(e.g. 'openid offline_access https://outlook.office365.us/SMTP.Send').",
+         "(e.g. 'offline_access https://outlook.office365.us/SMTP.Send', "
+         "or 'https://outlook.office365.us/.default' with --client-credentials).",
 )
 sp_get_token.add_argument(
     '--overwrite-existing-token',
@@ -377,6 +550,10 @@ sp_get_token.add_argument(
 sp_get_token.add_argument(
     '--local-listen-port', type=int, default=54332,
     help='port to launch local http listener on',
+)
+sp_get_token.add_argument(
+    '--local-listen-address', default='127.0.0.1',
+    help="address to bind the local http listener to (default: 127.0.0.1)",
 )
 sp_get_token.add_argument(
     'output_file', nargs='?', type=str, default='-',
@@ -432,7 +609,8 @@ def main() -> None:
         sys.exit(1)
     try:
       args = parser.parse_intermixed_args()
-    except:
+    except TypeError:
+      # parse_intermixed_args() does not support subparsers on older Pythons.
       args = parser.parse_args()
     if hasattr(args, 'func'):
       args.func(args)

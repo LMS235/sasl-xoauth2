@@ -17,13 +17,15 @@
 #include <sasl/sasl.h>
 #include <sasl/saslplug.h>
 
+#include <new>
+
 #include "client.h"
 #include "config.h"
 
 namespace {
 
 int mech_new(void *, sasl_client_params_t *params, void **context) {
-  sasl_xoauth2::Client *client = new sasl_xoauth2::Client();
+  sasl_xoauth2::Client *client = new (std::nothrow) sasl_xoauth2::Client();
   if (!client) {
     params->utils->seterror(params->utils->conn, 0,
                             "Failed to create Client instance.");

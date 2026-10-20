@@ -133,6 +133,13 @@ int RequestPrompts(sasl_client_params_t *params, sasl_interact_t **prompts,
   return SASL_INTERACT;
 }
 
+bool IsValidResponseField(const std::string &value) {
+  for (const unsigned char c : value) {
+    if (c < 0x20 || c == 0x7f) return false;
+  }
+  return true;
+}
+
 Log::Options GetLogOptions() {
   if (Config::Get()->always_log_to_syslog()) return Log::OPTIONS_IMMEDIATE;
   if (Config::Get()->log_full_trace_on_failure())
@@ -282,6 +289,17 @@ int Client::SendToken(const char **to_server, unsigned int *to_server_len) {
   std::string token;
   int err = token_->GetAccessToken(&token);
   if (err != SASL_OK) return err;
+
+  // \1 separates the fields of the XOAUTH2 initial response, so neither value
+  // may contain it (nor any other control character).
+  if (!IsValidResponseField(user_)) {
+    log_->Write("Client::SendToken: invalid user name");
+    return SASL_BADPARAM;
+  }
+  if (token.empty() || !IsValidResponseField(token)) {
+    log_->Write("Client::SendToken: invalid access token");
+    return SASL_BADPROT;
+  }
 
   response_ = "user=" + user_ + "\1auth=Bearer " + token + "\1\1";
   log_->Write("Client::SendToken: user=%s, token=%s", user_.c_str(),

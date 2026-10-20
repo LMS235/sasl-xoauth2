@@ -34,6 +34,8 @@ constexpr char kConfigFilePath[] = CONFIG_FILE_FULL_PATH;
 bool s_log_to_stderr = false;
 Config *s_config = nullptr;
 
+void Log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 void Log(const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -78,7 +80,12 @@ int Transform(std::string in, std::string *out) {
 
 template <>
 int Transform(std::string in, int *out) {
-  *out = stoi(in);
+  size_t parsed = 0;
+  *out = stoi(in, &parsed);
+  if (parsed != in.size()) {
+    Log("sasl-xoauth2: Invalid integer value '%s'.\n", in.c_str());
+    return SASL_FAIL;
+  }
   return SASL_OK;
 }
 
@@ -136,10 +143,18 @@ int Config::InitForTesting(const Json::Value &root) {
 
 Config *Config::Get() {
   if (!s_config) {
+    // Never terminate the host process (e.g. Postfix) from inside a plugin.
+    // Defaults lack a client ID, so token requests fail cleanly instead.
     Log("sasl-xoauth2: Attempt to fetch before calling Init()!\n");
-    exit(1);
+    static Config s_fallback;
+    return &s_fallback;
   }
   return s_config;
+}
+
+/* static */ bool Config::IsValidGrantType(const std::string &grant_type) {
+  return grant_type == kGrantTypeRefreshToken ||
+         grant_type == kGrantTypeClientCredentials;
 }
 
 int Config::Init(const Json::Value &root) {
@@ -169,6 +184,10 @@ int Config::Init(const Json::Value &root) {
 
     err = Fetch(root, "refresh_window", true, &refresh_window_);
     if (err != SASL_OK) return err;
+    if (refresh_window_ < 0) {
+      Log("sasl-xoauth2: refresh_window must not be negative.\n");
+      return SASL_FAIL;
+    }
 
     err = Fetch(root, "proxy", true, &proxy_);
     if (err != SASL_OK) return err;
@@ -179,7 +198,25 @@ int Config::Init(const Json::Value &root) {
     err = Fetch(root, "ca_certs_dir", true, &ca_certs_dir_);
     if (err != SASL_OK) return err;
 
-    return 0;
+    err = Fetch(root, "grant_type", true, &grant_type_);
+    if (err != SASL_OK) return err;
+    if (!IsValidGrantType(grant_type_)) {
+      Log("sasl-xoauth2: Invalid grant_type '%s'. Need either '%s' or '%s'.\n",
+          grant_type_.c_str(), kGrantTypeRefreshToken,
+          kGrantTypeClientCredentials);
+      return SASL_FAIL;
+    }
+
+    err = Fetch(root, "scope", true, &scope_);
+    if (err != SASL_OK) return err;
+    if (grant_type_ == kGrantTypeClientCredentials && scope_.empty()) {
+      // Not fatal: the scope may instead be set in each token file.
+      Log("sasl-xoauth2: grant_type '%s' needs a scope; set it here or in "
+          "each token file.\n",
+          kGrantTypeClientCredentials);
+    }
+
+    return SASL_OK;
 
   } catch (const std::exception &e) {
     Log("sasl-xoauth2: Exception during init: %s\n", e.what());

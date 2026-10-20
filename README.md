@@ -189,6 +189,35 @@ This means that **even though the path in `/etc/postfix/sasl_passwd` is
 (and should be) `/etc/tokens/username@domain.com`**, at runtime Postfix will
 attempt to read from `/var/spool/postfix/etc/tokens/username@domain.com`.
 
+#### A Note on Token File Permissions
+
+Token files contain secrets (refresh tokens, and possibly client secrets), so
+they should only be readable by the user Postfix runs as. sasl-xoauth2 updates
+a token file by writing a new file next to it and renaming it into place, and
+it serializes token refreshes between Postfix processes with a lock file
+(`<token file>.lock`). The token *directory* must therefore be writable by the
+Postfix user:
+
+```
+$ sudo chown -R postfix:postfix /etc/tokens
+$ sudo chmod 700 /etc/tokens
+$ sudo chmod 600 /etc/tokens/*
+```
+
+or, with chroot:
+
+```
+$ sudo chown -R postfix:postfix /var/spool/postfix/etc/tokens
+$ sudo chmod 700 /var/spool/postfix/etc/tokens
+$ sudo chmod 600 /var/spool/postfix/etc/tokens/*
+```
+
+Updated token files keep the owner and group permission bits of the file they
+replace; permissions for other users are never carried over. (Versions before
+0.29 created updated token files according to the process umask, which usually
+made them world-readable. Re-run the `chmod` above after upgrading.)
+`sasl-xoauth2-tool` likewise creates token files readable by their owner only.
+
 #### SSL/TLS Certificates
 
 If you see an error message similar to the following, you may need to copy over
@@ -210,7 +239,13 @@ The Debian and Ubuntu packages install a script that is automatically run by
 `update-ca-certificates` to ensure the certificates are copied whenever the
 system certificates are updated:
 `/etc/ca-certificates/update.d/postfix-sasl-xoauth2-update-ca-certs`. It is also
-run when the package is installed.
+run when the package is installed. The script replaces the chroot copy as a
+whole, so certificates removed from the system are removed from the chroot too.
+
+Token endpoints must use `https://`; sasl-xoauth2 does not send credentials over
+plain HTTP and does not follow redirects. Requests time out after 10 seconds
+(connect) and 30 seconds (total), so an unreachable endpoint cannot stall mail
+delivery indefinitely.
 
 sasl-xoauth2 also provides two configuration variables, `ca_bundle_file` and
 `ca_certs_dir`, that may be used to manually configure where the SSL/TLS
@@ -270,10 +305,14 @@ $ sasl-xoauth2-tool get-token gmail \
     --client-secret=CLIENT_SECRET_FROM_SASL_XOAUTH2_CONF \
     --scope="https://mail.google.com/"
 
-Please open this URL in a browser ON THIS HOST:
+Please open this URL in a browser ON THIS HOST (or that has port 54332 forwarded to this host):
 
-https://accounts.google.com/o/oauth2/auth?client_id=&scope=&response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A12345%2Foauth2_result
+http://127.0.0.1:54332/auth
 ```
+
+The tool listens on `127.0.0.1` only (use `--local-listen-address` to change
+this, e.g. inside a container), and protects the exchange with a random `state`
+and PKCE.
 
 (This script must run on the same host that is opening the URL -- it's not
 possible to copy the URL and paste it into a browser on another computer. This
@@ -304,17 +343,8 @@ In my configuration, chroot is enabled and so even though
 my token file is `/var/spool/postfix/etc/tokens/username@domain.com`.
 
 It may be necessary to adjust permissions on the token file so that Postfix (or,
-more accurately, sasl-xoauth2 running as the Postfix user) can update it:
-
-```
-$ sudo chown -R postfix:postfix /etc/tokens
-```
-
-or:
-
-```
-$ sudo chown -R postfix:postfix /var/spool/postfix/etc/tokens
-```
+more accurately, sasl-xoauth2 running as the Postfix user) can update it. See
+[A Note on Token File Permissions](#a-note-on-token-file-permissions).
 
 Skip to [restart Postfix](#restart-postfix) below.
 
@@ -358,10 +388,11 @@ Leave `client_secret` blank. Additionally, explicitly set the token endpoint
 }
 ```
 
-> [!WARNING] When using the Public Preview of Microsoft's new HVE endpoint
-> (smtp-hve.office365.com), a custom `refresh_window` should be set in the
-> configuration file to at least 600 seconds (10 minutes) to prevent the "501
-> 5.5.127 Invalid XOAUTH2 auth data - Token will expire soon error" error.
+> [!WARNING] When using Microsoft's HVE endpoint (smtp-hve.office365.com), set
+> `refresh_window` in the configuration file to at least 600 seconds (10
+> minutes) to prevent the "501 5.5.127 Invalid XOAUTH2 auth data - Token will
+> expire soon" error. (Before version 0.29, a `refresh_window` set in the
+> configuration file had no effect.)
 
 We'll also need these credentials in the next step.
 
@@ -418,7 +449,7 @@ $ sasl-xoauth2-tool get-token outlook \
     --client-id=CLIENT_ID \
     --tenant=TENANT_ID \
     --login-base=https://login.microsoftonline.us \
-    --scope="openid offline_access https://outlook.office365.us/SMTP.Send" \
+    --scope="offline_access https://outlook.office365.us/SMTP.Send" \
     --use-device-flow
 ```
 
@@ -457,17 +488,94 @@ Acquired token.
 
 It may be necessary to adjust permissions on the resulting token file so that
 Postfix (or, more accurately, sasl-xoauth2 running as the Postfix user) can
-update it:
+update it. See [A Note on Token File Permissions](#a-note-on-token-file-permissions).
 
-```
-$ sudo chown -R postfix:postfix /etc/tokens
+### Outlook/Office 365 Configuration (Client Credentials, App-Only)
+
+For an unattended relay in a Microsoft 365 organization, the [client
+credentials grant
+flow](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth#use-client-credentials-grant-flow-to-authenticate-smtp-imap-and-pop-connections)
+is usually the most robust choice: no user ever signs in, and there is no
+refresh token that can expire after 90 days of inactivity, be revoked by a
+password change, or be blocked by a Conditional Access policy. sasl-xoauth2
+simply requests a new access token with the client ID and secret whenever the
+current one is about to expire.
+
+#### Client Credentials
+
+1. [Register an
+   application](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)
+   for "Accounts in this organizational directory only", and create a client
+   secret for it (note its expiry date -- see below).
+1. Under "API permissions", choose "Add a permission", then "APIs my
+   organization uses", search for "Office 365 Exchange Online", choose
+   "Application permissions", and select `SMTP.SendAsApp`. Then "Grant admin
+   consent".
+1. Register the application's service principal in Exchange Online and give it
+   access to the mailbox to send as (the `OBJECT_ID` is the one from the
+   *Enterprise applications* page, **not** the one from *App registrations*):
+
+   ```
+   Connect-ExchangeOnline -Organization TENANT_ID
+   New-ServicePrincipal -AppId APPLICATION_ID -ObjectId OBJECT_ID -DisplayName "sasl-xoauth2"
+   $sp = Get-ServicePrincipal -Identity "sasl-xoauth2"
+   Add-MailboxPermission -Identity "relay@contoso.com" -User $sp.Identity -AccessRights FullAccess
+   ```
+
+   To send as *other* addresses from that mailbox, grant `SendAs` with
+   `Add-RecipientPermission` as well. SMTP AUTH must also be enabled for the
+   mailbox (`Set-CASMailbox -Identity relay@contoso.com
+   -SmtpClientAuthenticationDisabled $false`).
+
+#### Token File
+
+Create the token file with `sasl-xoauth2-tool`, which also checks that a token
+can actually be obtained:
+
+```shell
+$ sasl-xoauth2-tool get-token outlook \
+    PATH_TO_TOKENS_FILE \
+    --client-credentials \
+    --tenant=TENANT_ID \
+    --client-id=APPLICATION_ID \
+    --mailbox=relay@contoso.com
+Please enter OAuth2 client secret:
+Acquired app-only token.
+Wrote token to PATH_TO_TOKENS_FILE.
 ```
 
-or:
+The resulting file contains everything needed to request new tokens (including
+the client secret, which is why it is created readable by its owner only):
 
+```json
+{
+  "grant_type": "client_credentials",
+  "scope": "https://outlook.office365.com/.default",
+  "token_endpoint": "https://login.microsoftonline.com/TENANT_ID/oauth2/v2.0/token",
+  "client_id": "APPLICATION_ID",
+  "client_secret": "client secret",
+  "user": "relay@contoso.com",
+  "access_token": "...",
+  "expiry": "..."
+}
 ```
-$ sudo chown -R postfix:postfix /var/spool/postfix/etc/tokens
-```
+
+Use `--cloud` for national clouds. `grant_type` and `scope` may also be set in
+`/etc/sasl-xoauth2.conf` to apply to all token files. When the client secret
+expires, requests fail with `invalid_client`; create a new secret and update
+the token file.
+
+### Notes on Microsoft 365
+
+- Exchange Online reports a rejected token with `535 5.7.3 Authentication
+  unsuccessful` and no further details. Use `sasl-xoauth2-tool
+  test-token-refresh` to see the reason from Microsoft Entra ID (an `AADSTS`
+  code); sasl-xoauth2 also logs it, with a hint, when a token request fails.
+- A refresh token that has expired or been revoked (`invalid_grant`) can only
+  be replaced by running `sasl-xoauth2-tool get-token` again. The client
+  credentials flow above avoids refresh tokens altogether.
+- sasl-xoauth2 requests a new access token `refresh_window` seconds (default:
+  300) before the current one expires; see the HVE note above.
 
 ### Outlook/Office 365 Configuration (Legacy Client) (Deprecated)
 
@@ -530,7 +638,7 @@ $ sasl-xoauth2-tool get-token outlook \
 
 Please visit the following link in a web browser, then paste the resulting URL:
 
-https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_id=REDACTED&response_type=code&redirect_uri=https%3A//login.microsoftonline.com/common/oauth2/nativeclient&response_mode=query&scope=openid%20offline_access%20https%3A//outlook.office.com/SMTP.Send
+https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_id=REDACTED&response_type=code&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient&response_mode=query&scope=offline_access+https%3A%2F%2Foutlook.office.com%2FSMTP.Send&state=REDACTED&code_challenge=REDACTED&code_challenge_method=S256
 
 Resulting URL: 
 ```
@@ -551,23 +659,13 @@ script, and the script will extract the URL components needed to obtain initial
 tokens:
 
 ```
-Resulting URL: https://login.microsoftonline.com/common/oauth2/nativeclient?code=REDACTED
-Tokens written to PATH_TO_TOKENS_FILE.
+Resulting URL: https://login.microsoftonline.com/common/oauth2/nativeclient?code=REDACTED&state=REDACTED
+Wrote token to PATH_TO_TOKENS_FILE.
 ```
 
 It may be necessary to adjust permissions on the resulting token file so that
 Postfix (or, more accurately, sasl-xoauth2 running as the Postfix user) can
-update it:
-
-```
-$ sudo chown -R postfix:postfix /etc/tokens
-```
-
-or:
-
-```
-$ sudo chown -R postfix:postfix /var/spool/postfix/etc/tokens
-```
+update it. See [A Note on Token File Permissions](#a-note-on-token-file-permissions).
 
 #### A Note on Client Secrets
 
@@ -631,14 +729,16 @@ Next, test your token file:
 $ sasl-xoauth2-tool test-token-refresh ./bad-token.json
 Config check passed.
 2022-09-10 09:18:59: TokenStore::Read: file=./bad-token.json
-2022-09-10 09:18:59: TokenStore::Read: refresh=REDACTED
+2022-09-10 09:18:59: TokenStore::Read: grant_type=refresh_token, refresh=<redacted, 103 bytes>, access=<redacted, 215 bytes>, user=
 2022-09-10 09:18:59: TokenStore::Refresh: attempt 1
 2022-09-10 09:18:59: TokenStore::Refresh: token_endpoint: https://accounts.google.com/o/oauth2/token
-2022-09-10 09:18:59: TokenStore::Refresh: request: client_id=REDACTED&client_secret=REDACTED&grant_type=refresh_token&refresh_token=REDACTED
+2022-09-10 09:18:59: TokenStore::Refresh: request: grant_type=refresh_token, client_id=REDACTED, client_secret=<redacted, 35 bytes>, refresh_token=<redacted, 103 bytes>, scope=<not sent>
 2022-09-10 09:19:00: TokenStore::Refresh: code=400, response={
   "error": "invalid_grant",
   "error_description": "Bad Request"
 }
+2022-09-10 09:19:00: TokenStore::Refresh: error=invalid_grant, description=Bad Request
+2022-09-10 09:19:00: TokenStore::Refresh: hint: the refresh token was rejected (expired, revoked, or issued for a different client/tenant/scope); obtain a new one with 'sasl-xoauth2-tool get-token'
 2022-09-10 09:19:00: TokenStore::Refresh: request failed
 Token refresh failed.
 $ sasl-xoauth2-tool test-token-refresh ./good-token.json
@@ -679,6 +779,9 @@ in `/etc/sasl-xoauth2.conf`. Set them when setting the initial access token:
 
 `sasl-xoauth2-tool` has an argument `--overwrite-existing-token` to preserve the content of these additional fields
 when manually updating an expired or invalidated token.
+
+The token file may also set `grant_type`, `scope`, `proxy`, `ca_bundle_file`,
+`ca_certs_dir` and `refresh_window` (see `sasl-xoauth2.conf(5)`).
 
 ## Debugging
 

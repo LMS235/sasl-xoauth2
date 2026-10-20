@@ -95,7 +95,8 @@ void EnableLoggingForTesting() {
 std::unique_ptr<Log> Log::Create(Options options, Target target) {
   options = static_cast<Options>(options | s_default_options);
   if (target == TARGET_DEFAULT) target = s_default_target;
-  return std::unique_ptr<Log>(new Log(CreateLogImpl(target), options));
+  return std::unique_ptr<Log>(
+      new Log(CreateLogImpl(target), options, target == TARGET_NONE));
 }
 
 Log::~Log() {
@@ -103,19 +104,22 @@ Log::~Log() {
 }
 
 void Log::Write(const char *fmt, ...) {
+  if (discard_) return;
+
   va_list args;
 
   va_start(args, fmt);
   int buf_len = vsnprintf(nullptr, 0, fmt, args);
   va_end(args);
+  if (buf_len < 0) return;
 
-  // +1 for the trailing \0.
+  // +1 for the trailing \0, which is not part of the line.
   std::vector<char> buf(buf_len + 1);
   va_start(args, fmt);
   vsnprintf(buf.data(), buf.size(), fmt, args);
   va_end(args);
 
-  const std::string line(buf.begin(), buf.end());
+  const std::string line(buf.data(), buf_len);
   if (options_ & OPTIONS_IMMEDIATE) {
     impl_->WriteLine(line);
   } else {
