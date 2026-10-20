@@ -26,12 +26,14 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <fstream>
 #include <sstream>
 #include <vector>
 
+#include "client_assertion.h"
 #include "config.h"
 #include "http.h"
 #include "log.h"
@@ -177,7 +179,12 @@ int WriteFileAtomically(Log *log, const std::string &path,
     log->Write("TokenStore::Write: unable to set mode of %s: %s",
                temp_path.c_str(), strerror(errno));
   }
-  if (have_existing && existing.st_gid != getegid() &&
+  // Compare with the group the new file actually got (which, in a setgid
+  // directory, is the directory's group rather than the writer's).
+  struct stat created = {};
+  const gid_t new_gid =
+      (fstat(fd, &created) == 0) ? created.st_gid : static_cast<gid_t>(-1);
+  if (have_existing && existing.st_gid != new_gid &&
       fchown(fd, static_cast<uid_t>(-1), existing.st_gid) != 0) {
     // The new file belongs to a different group, which must not inherit the
     // old group's access.
@@ -224,7 +231,7 @@ const char *HintForTokenError(const std::string &error) {
   if (error == "invalid_client")
     return "the client was rejected; check client_id and client_secret (an "
            "Entra ID client secret may have expired; public clients must use "
-           "an empty client_secret)";
+           "an empty client_secret) or the client certificate";
   if (error == "unauthorized_client")
     return "the client is unknown in this tenant or may not use this grant "
            "type; check client_id, the tenant in token_endpoint, admin "
@@ -235,21 +242,42 @@ const char *HintForTokenError(const std::string &error) {
   return nullptr;
 }
 
-void LogTokenError(Log *log, const std::string &response) {
+// Errors that only go away when someone fixes the configuration or obtains new
+// credentials; anything else (e.g. HTTP 429 or 5xx) may be transient.
+bool IsPermanentTokenError(const std::string &error) {
+  return error == "invalid_grant" || error == "invalid_client" ||
+         error == "unauthorized_client" || error == "invalid_scope" ||
+         error == "unsupported_grant_type" || error == "invalid_request";
+}
+
+struct TokenError {
+  std::string error;
+  std::string description;
+};
+
+TokenError ParseTokenError(const std::string &response) {
+  TokenError result;
   try {
     std::stringstream ss(response);
     Json::Value root;
     ss >> root;
-    if (!root.isObject() || !root.isMember("error")) return;
-    const std::string error = root["error"].asString();
-    log->Write("TokenStore::Refresh: error=%s, description=%s", error.c_str(),
-               root.get("error_description", "").asString().c_str());
-    const char *hint = HintForTokenError(error);
-    if (hint) log->Write("TokenStore::Refresh: hint: %s", hint);
+    if (root.isObject() && root.isMember("error")) {
+      result.error = root["error"].asString();
+      result.description = root.get("error_description", "").asString();
+    }
   } catch (const std::exception &) {
-    // Not JSON; the raw response has already been logged.
+    // Not JSON (e.g. an HTML error page from a proxy).
   }
+  return result;
 }
+
+// Access tokens are refreshed long before they expire; if refreshing fails, a
+// token with at least this much life left is still used.
+constexpr time_t kMinRemainingLifetimeSec = 60;
+
+// Upper bound for a token lifetime (expires_in) from the provider. Microsoft
+// issues up to about 28 hours (continuous access evaluation).
+constexpr long long kMaxTokenLifetimeSec = 7 * 24 * 3600;
 
 }  // namespace
 
@@ -272,11 +300,26 @@ bool TokenStore::NeedsRefresh() const {
   return access_.empty() || (time(nullptr) + RefreshWindow()) >= expiry_;
 }
 
+int TokenStore::Fail(bool permanent, int err) {
+  last_error_permanent_ = permanent;
+  return err;
+}
+
 int TokenStore::GetAccessToken(std::string *token) {
   if (NeedsRefresh()) {
     log_->Write("TokenStore::GetAccessToken: token expired. refreshing.");
     int err = Refresh();
-    if (err != SASL_OK) return err;
+    if (err != SASL_OK) {
+      // A refresh starts refresh_window seconds before the token expires. If
+      // the provider is unreachable in that window, keep using the token
+      // while it is still valid rather than deferring mail.
+      const time_t remaining = expiry_ - time(nullptr);
+      if (access_.empty() || remaining < kMinRemainingLifetimeSec) return err;
+      log_->Write(
+          "TokenStore::GetAccessToken: refresh failed, using the current "
+          "token (valid for %lld more seconds)",
+          static_cast<long long>(remaining));
+    }
   }
 
   *token = access_;
@@ -292,8 +335,10 @@ bool TokenStore::ReloadIfRefreshedElsewhere() {
 }
 
 int TokenStore::Refresh() {
+  last_error_permanent_ = false;
   if (refresh_attempts_ >= kMaxRefreshAttempts) {
-    log_->Write("TokenStore::Refresh: exceeded maximum attempts");
+    log_->Error("token request for %s: exceeded maximum attempts",
+                path_.c_str());
     return SASL_BADPROT;
   }
   refresh_attempts_++;
@@ -310,6 +355,25 @@ int TokenStore::Refresh() {
     return SASL_OK;
   }
 
+  int err = RequestToken();
+  if (err != SASL_OK) return err;
+
+  if (Write() != SASL_OK) {
+    // The new token works; only storing it failed (e.g. a read-only file
+    // system, a full disk, or wrong ownership of the token directory). Use it
+    // anyway, but report the problem regardless of the log settings: until it
+    // is fixed, every connection requests a new token.
+    syslog(LOG_ERR,
+           "[sasl-xoauth2] unable to update token file %s; using the new token "
+           "without storing it. Check that the mail system can write to the "
+           "token directory.",
+           EscapeForLog(path_).c_str());
+    log_->Write("TokenStore::Refresh: unable to store the new token");
+  }
+  return SASL_OK;
+}
+
+int TokenStore::RequestToken() {
   const Config *config = Config::Get();
   const std::string grant_type = GrantType();
   const std::string client_id =
@@ -324,19 +388,78 @@ int TokenStore::Refresh() {
       override_ca_bundle_file_.value_or(config->ca_bundle_file());
   const std::string ca_certs_dir =
       override_ca_certs_dir_.value_or(config->ca_certs_dir());
+  const std::string certificate_file =
+      override_client_certificate_file_.value_or(
+          config->client_certificate_file());
+  std::string private_key_file = override_client_private_key_file_.value_or(
+      config->client_private_key_file());
+  if (private_key_file.empty()) private_key_file = certificate_file;
+  const bool use_certificate = !certificate_file.empty();
+
+  const std::string endpoint_for_log = EscapeForLog(token_endpoint);
+  const std::string path_for_log = EscapeForLog(path_);
 
   if (grant_type == kGrantTypeClientCredentials && scope.empty()) {
-    log_->Write("TokenStore::Refresh: grant_type %s requires a scope",
-                grant_type.c_str());
-    return SASL_FAIL;
+    log_->Error("token request for %s: grant_type %s requires a scope",
+                path_for_log.c_str(), grant_type.c_str());
+    return Fail(/*permanent=*/true, SASL_FAIL);
+  }
+  if (grant_type == kGrantTypeClientCredentials && !use_certificate &&
+      client_secret.empty()) {
+    log_->Error(
+        "token request for %s: grant_type %s requires a client certificate "
+        "or a client_secret",
+        path_for_log.c_str(), grant_type.c_str());
+    return Fail(/*permanent=*/true, SASL_FAIL);
+  }
+
+  // A token file that sends requests elsewhere (another endpoint, proxy or CA)
+  // must bring its own client secret: the configured one is only sent where
+  // the configuration says. (A client assertion names its endpoint as
+  // audience, so it is useless anywhere else and needs no such check.)
+  const auto differs = [](const std::optional<std::string> &override_value,
+                          const std::string &config_value) {
+    return override_value && *override_value != config_value;
+  };
+  const bool connection_overridden =
+      differs(override_token_endpoint_, config->token_endpoint()) ||
+      differs(override_proxy_, config->proxy()) ||
+      differs(override_ca_bundle_file_, config->ca_bundle_file()) ||
+      differs(override_ca_certs_dir_, config->ca_certs_dir());
+  if (!use_certificate && connection_overridden && !override_client_secret_ &&
+      !config->client_secret().empty()) {
+    log_->Error(
+        "token request for %s: the token file overrides token_endpoint, "
+        "proxy or CA settings but not client_secret; refusing to send the "
+        "configured client_secret there (set client_secret in the token "
+        "file)",
+        path_for_log.c_str());
+    return Fail(/*permanent=*/true, SASL_FAIL);
   }
 
   std::string request = "grant_type=" + FormUrlEncode(grant_type) +
                         "&client_id=" + FormUrlEncode(client_id);
-  // Public clients (e.g. Microsoft device flow) have no secret and must not
-  // send one.
-  if (!client_secret.empty())
-    request += "&client_secret=" + FormUrlEncode(client_secret);
+  std::string credential_for_log;
+  if (use_certificate) {
+    std::string assertion, assertion_error;
+    if (!CreateClientAssertion(certificate_file, private_key_file, client_id,
+                               token_endpoint, time(nullptr), &assertion,
+                               &assertion_error)) {
+      log_->Error("token request for %s: client certificate: %s",
+                  path_for_log.c_str(), EscapeForLog(assertion_error).c_str());
+      return Fail(/*permanent=*/true, SASL_FAIL);
+    }
+    request += "&client_assertion_type=" + FormUrlEncode(kClientAssertionType) +
+               "&client_assertion=" + FormUrlEncode(assertion);
+    credential_for_log =
+        "client_assertion=<certificate " + EscapeForLog(certificate_file) + ">";
+  } else {
+    // Public clients (e.g. Microsoft device flow) have no secret and must not
+    // send one.
+    if (!client_secret.empty())
+      request += "&client_secret=" + FormUrlEncode(client_secret);
+    credential_for_log = "client_secret=" + RedactSecret(client_secret);
+  }
   if (grant_type == kGrantTypeRefreshToken)
     request += "&refresh_token=" + FormUrlEncode(refresh_);
   // The scope is needed (only) to request app-only tokens. Refresh token
@@ -348,15 +471,15 @@ int TokenStore::Refresh() {
   std::string response;
   long response_code = 0;
   log_->Write("TokenStore::Refresh: token_endpoint: %s",
-              token_endpoint.c_str());
+              endpoint_for_log.c_str());
   log_->Write(
-      "TokenStore::Refresh: request: grant_type=%s, client_id=%s, "
-      "client_secret=%s, refresh_token=%s, scope=%s",
-      grant_type.c_str(), client_id.c_str(),
-      RedactSecret(client_secret).c_str(),
+      "TokenStore::Refresh: request: grant_type=%s, client_id=%s, %s, "
+      "refresh_token=%s, scope=%s",
+      grant_type.c_str(), EscapeForLog(client_id).c_str(),
+      credential_for_log.c_str(),
       grant_type == kGrantTypeRefreshToken ? RedactSecret(refresh_).c_str()
                                            : "<not sent>",
-      send_scope ? scope.c_str() : "<not sent>");
+      send_scope ? EscapeForLog(scope).c_str() : "<not sent>");
 
   std::string http_error;
   int err = HttpPost({.url = token_endpoint,
@@ -368,17 +491,26 @@ int TokenStore::Refresh() {
                       .response = &response,
                       .error = &http_error});
   if (err != SASL_OK) {
-    log_->Write("TokenStore::Refresh: http error: %s", http_error.c_str());
-    return err;
+    log_->Error("token request for %s to %s failed: %s", path_for_log.c_str(),
+                endpoint_for_log.c_str(), EscapeForLog(http_error).c_str());
+    return Fail(/*permanent=*/false, err);
   }
 
   if (response_code != 200) {
     // An error response carries the provider's reason and no tokens.
     log_->Write("TokenStore::Refresh: code=%ld, response=%s", response_code,
-                response.c_str());
-    LogTokenError(log_, response);
-    log_->Write("TokenStore::Refresh: request failed");
-    return SASL_BADPROT;
+                EscapeForLog(response).c_str());
+    const TokenError token_error = ParseTokenError(response);
+    const char *hint = HintForTokenError(token_error.error);
+    log_->Error("token request for %s to %s failed: HTTP %ld %s%s%s%s%s",
+                path_for_log.c_str(), endpoint_for_log.c_str(), response_code,
+                token_error.error.empty()
+                    ? "(no error details)"
+                    : EscapeForLog(token_error.error, 64).c_str(),
+                token_error.description.empty() ? "" : ": ",
+                EscapeForLog(token_error.description, 512).c_str(),
+                hint ? "; hint: " : "", hint ? hint : "");
+    return Fail(IsPermanentTokenError(token_error.error), SASL_BADPROT);
   }
   // A successful response carries the new access (and maybe refresh) token.
   log_->Write("TokenStore::Refresh: code=%ld, response=%s", response_code,
@@ -390,18 +522,29 @@ int TokenStore::Refresh() {
     ss >> root;
     if (!root.isObject() || !root.isMember("access_token") ||
         !root.isMember("expires_in")) {
-      log_->Write("TokenStore::Refresh: response doesn't contain access_token");
-      return SASL_BADPROT;
+      log_->Error(
+          "token request for %s: response lacks access_token or "
+          "expires_in",
+          path_for_log.c_str());
+      return Fail(/*permanent=*/false, SASL_BADPROT);
     }
     const std::string access_token = root["access_token"].asString();
-    if (access_token.empty()) {
-      log_->Write("TokenStore::Refresh: empty access_token");
-      return SASL_BADPROT;
+    long long expiry_sec = 0;
+    const Json::Value &expires_in = root["expires_in"];
+    const bool expiry_ok =
+        expires_in.isIntegral()
+            ? (expiry_sec = expires_in.asLargestInt(), true)
+            : (expires_in.isString() &&
+               ParseInteger(expires_in.asString(), &expiry_sec));
+    if (access_token.empty() || !expiry_ok || expiry_sec <= 0) {
+      log_->Error("token request for %s: invalid access_token or expires_in",
+                  path_for_log.c_str());
+      return Fail(/*permanent=*/false, SASL_BADPROT);
     }
-    const long long expiry_sec = stoll(root["expires_in"].asString());
-    if (expiry_sec <= 0) {
-      log_->Write("TokenStore::Refresh: invalid expiry");
-      return SASL_BADPROT;
+    if (expiry_sec > kMaxTokenLifetimeSec) {
+      log_->Write("TokenStore::Refresh: limiting token lifetime of %lld s",
+                  expiry_sec);
+      expiry_sec = kMaxTokenLifetimeSec;
     }
     if (expiry_sec <= RefreshWindow()) {
       log_->Write(
@@ -420,11 +563,12 @@ int TokenStore::Refresh() {
     }
     expiry_ = time(nullptr) + static_cast<time_t>(expiry_sec);
   } catch (const std::exception &e) {
-    log_->Write("TokenStore::Refresh: exception=%s", e.what());
-    return SASL_FAIL;
+    log_->Error("token request for %s: unreadable response: %s",
+                path_for_log.c_str(), EscapeForLog(e.what()).c_str());
+    return Fail(/*permanent=*/false, SASL_FAIL);
   }
 
-  return Write();
+  return SASL_OK;
 }
 
 TokenStore::TokenStore(Log *log, const std::string &path, bool enable_updates)
@@ -436,21 +580,23 @@ int TokenStore::Read() {
 
     std::ifstream file(path_);
     if (!file.good()) {
-      log_->Write("TokenStore::Read: failed to open file %s: %s", path_.c_str(),
-                  strerror(errno));
-      return SASL_FAIL;
+      log_->Error("unable to read token file %s: %s",
+                  EscapeForLog(path_).c_str(), strerror(errno));
+      return Fail(/*permanent=*/true, SASL_FAIL);
     }
 
     Json::Value root;
     file >> root;
     if (!root.isObject()) {
-      log_->Write("TokenStore::Read: not a JSON object");
-      return SASL_FAIL;
+      log_->Error("token file %s: not a JSON object",
+                  EscapeForLog(path_).c_str());
+      return Fail(/*permanent=*/true, SASL_FAIL);
     }
 
     // Parse into locals first so that a bad file leaves the store unchanged.
     std::optional<std::string> client_id, client_secret, token_endpoint, proxy,
-        ca_bundle_file, ca_certs_dir, grant_type, scope, user;
+        ca_bundle_file, ca_certs_dir, grant_type, scope, user,
+        client_certificate_file, client_private_key_file;
     ReadOverride(root, "client_id", &client_id);
     ReadOverride(root, "client_secret", &client_secret);
     ReadOverride(root, "token_endpoint", &token_endpoint);
@@ -460,23 +606,28 @@ int TokenStore::Read() {
     ReadOverride(root, "grant_type", &grant_type);
     ReadOverride(root, "scope", &scope);
     ReadOverride(root, "user", &user);
+    ReadOverride(root, "client_certificate_file", &client_certificate_file);
+    ReadOverride(root, "client_private_key_file", &client_private_key_file);
 
     if (grant_type && !Config::IsValidGrantType(*grant_type)) {
-      log_->Write("TokenStore::Read: invalid grant_type %s",
-                  grant_type->c_str());
-      return SASL_FAIL;
+      log_->Error("token file %s: invalid grant_type %s",
+                  EscapeForLog(path_).c_str(),
+                  EscapeForLog(*grant_type, 64).c_str());
+      return Fail(/*permanent=*/true, SASL_FAIL);
     }
     const std::string effective_grant_type =
         grant_type.value_or(Config::Get()->grant_type());
 
     std::optional<int> refresh_window;
     if (root.isMember("refresh_window")) {
-      refresh_window = stoi(root["refresh_window"].asString());
-      if (!Config::IsValidRefreshWindow(*refresh_window)) {
-        log_->Write("TokenStore::Read: refresh_window out of range (0-%d)",
-                    kMaxRefreshWindow);
-        return SASL_FAIL;
+      long long value = 0;
+      if (!ParseInteger(root["refresh_window"].asString(), &value) ||
+          value < 0 || value > kMaxRefreshWindow) {
+        log_->Error("token file %s: refresh_window must be 0-%d seconds",
+                    EscapeForLog(path_).c_str(), kMaxRefreshWindow);
+        return Fail(/*permanent=*/true, SASL_FAIL);
       }
+      refresh_window = static_cast<int>(value);
       if (*refresh_window == 0) {
         // Up to version 0.28, every token update wrote "refresh_window": "0"
         // into the file (unintentionally), which then silently overrode the
@@ -489,16 +640,24 @@ int TokenStore::Read() {
     if (root.isMember("refresh_token"))
       refresh = root["refresh_token"].asString();
     if (effective_grant_type == kGrantTypeRefreshToken && refresh.empty()) {
-      log_->Write("TokenStore::Read: missing refresh_token");
-      return SASL_FAIL;
+      log_->Error("token file %s: missing refresh_token",
+                  EscapeForLog(path_).c_str());
+      return Fail(/*permanent=*/true, SASL_FAIL);
     }
 
     std::string access;
     if (root.isMember("access_token")) access = root["access_token"].asString();
     time_t expiry = 0;
     // stoll, not stoi: Unix times from 2038-01-19 on do not fit in an int.
-    if (root.isMember("expiry"))
-      expiry = static_cast<time_t>(stoll(root["expiry"].asString()));
+    if (root.isMember("expiry")) {
+      long long value = 0;
+      if (ParseInteger(root["expiry"].asString(), &value)) {
+        expiry = static_cast<time_t>(value);
+      } else {
+        // Not fatal: the token is merely treated as expired and refreshed.
+        log_->Write("TokenStore::Read: ignoring invalid expiry");
+      }
+    }
 
     override_client_id_ = client_id;
     override_client_secret_ = client_secret;
@@ -508,6 +667,8 @@ int TokenStore::Read() {
     override_ca_certs_dir_ = ca_certs_dir;
     override_grant_type_ = grant_type;
     override_scope_ = scope;
+    override_client_certificate_file_ = client_certificate_file;
+    override_client_private_key_file_ = client_private_key_file;
     override_refresh_window_ = refresh_window;
     refresh_ = refresh;
     access_ = access;
@@ -522,7 +683,9 @@ int TokenStore::Read() {
     return SASL_OK;
 
   } catch (const std::exception &e) {
-    log_->Write("TokenStore::Read: exception=%s", e.what());
+    log_->Error("unable to read token file %s: %s", EscapeForLog(path_).c_str(),
+                EscapeForLog(e.what()).c_str());
+    last_error_permanent_ = true;
     return SASL_FAIL;
   }
 }
@@ -550,6 +713,10 @@ int TokenStore::Write() {
     WriteOverride("ca_certs_dir", override_ca_certs_dir_, &root);
     WriteOverride("grant_type", override_grant_type_, &root);
     WriteOverride("scope", override_scope_, &root);
+    WriteOverride("client_certificate_file", override_client_certificate_file_,
+                  &root);
+    WriteOverride("client_private_key_file", override_client_private_key_file_,
+                  &root);
 
     if (override_refresh_window_) {
       root["refresh_window"] = std::to_string(*override_refresh_window_);

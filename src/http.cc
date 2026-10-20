@@ -130,15 +130,15 @@ int HttpPost(HttpPostOptions options) {
   *options.response_code = 0;
   options.response->clear();
 
+  // Declared before the handle, which refers to both until it is cleaned up.
+  char transport_error[CURL_ERROR_SIZE] = {'\0'};
+  RequestContext context(options.data);
+
   UniqueCURL curl(curl_easy_init());
   if (!curl) {
     *options.error = "Unable to create CURL handle.";
     return SASL_BADPROT;
   }
-
-  RequestContext context(options.data);
-
-  char transport_error[CURL_ERROR_SIZE] = {'\0'};
 
   // Behavior.
   curl_easy_setopt(curl.get(), CURLOPT_VERBOSE, false);

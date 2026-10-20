@@ -4,6 +4,7 @@
 
 import argparse
 import base64
+import fcntl
 import getpass
 import hashlib
 import http
@@ -21,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from typing import Optional,Dict,Union,IO,Any
+from typing import Callable,Optional,Dict,Union,Any
 
 try:
     import argcomplete #type: ignore
@@ -34,6 +35,7 @@ except ImportError:
 
 TEST_TOOL_PATH = '${CMAKE_INSTALL_FULL_LIBDIR}/${PROJECT_NAME}/test-config'
 DEFAULT_CONFIG_FILE = '${CMAKE_INSTALL_FULL_SYSCONFDIR}/${PROJECT_NAME}.conf'
+VERSION = '${PROJECT_VERSION}'
 
 ##########
 
@@ -82,46 +84,104 @@ def post_token_request(url:str, params:Dict[str,str]) -> Dict[str,Any]:
         raise Exception(f"Token request to {url} failed with HTTP {e.code}: {reason}") from None
 
 
-def dump_overwrite(token:dict, output_filename:str, input_dict:dict):
-    # overwrite fields in previous token (represented by input_dict)
-    # that also have values from new token
-    input_dict.update(token)
+def open_token_lock(output_filename:str) -> Optional[int]:
+    """Takes the lock the plugin takes while refreshing (<token file>.lock), so
+    that a token update and a plugin refresh cannot overwrite each other."""
+    lock_path = output_filename + '.lock'
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        print(f"Warning: cannot open lock file {lock_path}: {e}", file=sys.stderr)
+        return None
+    # A lock file created here (e.g. by root) must stay usable for the plugin:
+    # give it the owner of the token file, or of its directory.
+    try:
+        owner = os.lstat(output_filename) if os.path.lexists(output_filename) else \
+            os.stat(os.path.dirname(os.path.abspath(output_filename)))
+        st = os.fstat(fd)
+        if (st.st_uid, st.st_gid) != (owner.st_uid, owner.st_gid):
+            os.fchown(fd, owner.st_uid, owner.st_gid)
+    except OSError:
+        pass
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def dump_overwrite(token:dict, output_filename:str, merge_existing:bool,
+                   adjust:Optional[Callable[[dict], None]] = None) -> None:
+    """Writes |token| to |output_filename| ('-' for stdout). With
+    |merge_existing|, the fields of the current file are kept unless |token|
+    replaces them; |adjust| may change the merged result before writing."""
     if output_filename == '-':
-        json.dump(input_dict, sys.stdout, indent=4)
+        json.dump(token, sys.stdout, indent=4)
         print()
         return
-    # The token file holds secrets: create it readable by its owner only (or
-    # keep the owner/group bits of the file it replaces), and replace it
-    # atomically so a failure never leaves a truncated token file behind.
-    mode = 0o600
-    existing = None
+    lock_fd = open_token_lock(output_filename)
     try:
-        existing = os.stat(output_filename)
-        mode |= stat.S_IMODE(existing.st_mode) & 0o770
-    except FileNotFoundError:
-        pass
-    directory = os.path.dirname(os.path.abspath(output_filename))
-    fd, temp_path = tempfile.mkstemp(dir=directory, prefix='.sasl-xoauth2-')
-    try:
+        # Never write through (or copy the owner of) a symlink planted in the
+        # token directory.
+        existing = None
+        if os.path.lexists(output_filename):
+            existing = os.lstat(output_filename)
+            if not stat.S_ISREG(existing.st_mode):
+                raise Exception(f"Refusing to write {output_filename}: not a regular file (symlink?)")
+        contents:dict = {}
+        if merge_existing:
+            if existing is None:
+                raise Exception(f"Cannot overwrite nonexistent token file {output_filename}")
+            # Read under the lock: the plugin may have just updated the file.
+            fd = os.open(output_filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(fd, 'r') as input_file:
+                contents = json.load(input_file)
+        contents.update(token)
+        if adjust:
+            adjust(contents)
+
+        # The token file holds secrets: create it readable by its owner only (or
+        # keep the owner/group bits of the file it replaces), and replace it
+        # atomically so a failure never leaves a truncated token file behind.
+        mode = 0o600
         if existing:
-            # Keep the file usable by its owner (e.g. Postfix) when updated by
-            # another user (e.g. root).
-            try:
-                os.fchown(fd, existing.st_uid, existing.st_gid)
-            except PermissionError:
-                print(f"Warning: could not keep owner of {output_filename}; check its ownership.",
-                      file=sys.stderr)
-                mode &= 0o700
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, 'w') as output_file:
-            json.dump(input_dict, output_file, indent=4)
-            output_file.write('\n')
-            output_file.flush()
-            os.fsync(output_file.fileno())
-        os.replace(temp_path, output_filename)
-    except BaseException:
-        os.unlink(temp_path)
-        raise
+            mode |= stat.S_IMODE(existing.st_mode) & 0o770
+        directory = os.path.dirname(os.path.abspath(output_filename))
+        fd, temp_path = tempfile.mkstemp(dir=directory, prefix='.sasl-xoauth2-')
+        try:
+            if existing:
+                # Keep the file usable by its owner (e.g. Postfix) when updated by
+                # another user (e.g. root).
+                try:
+                    os.fchown(fd, existing.st_uid, existing.st_gid)
+                except PermissionError:
+                    print(f"Warning: could not keep owner of {output_filename}; check its ownership.",
+                          file=sys.stderr)
+                    mode &= 0o700
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, 'w') as output_file:
+                json.dump(contents, output_file, indent=4)
+                output_file.write('\n')
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            os.replace(temp_path, output_filename)
+        except BaseException:
+            os.unlink(temp_path)
+            raise
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def run_test_tool(test_args:list) -> int:
+    """Runs test-config the way Postfix runs the plugin: without proxy (or
+    other) environment variables, which Postfix does not pass on."""
+    proxy_vars = sorted(v for v in os.environ
+                        if v.lower() in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'))
+    if proxy_vars:
+        print(f"Note: ignoring {', '.join(proxy_vars)} from the environment, as Postfix "
+              "does; set 'proxy' in the configuration if a proxy is needed.", file=sys.stderr)
+    env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'}
+    if 'TZ' in os.environ:
+        env['TZ'] = os.environ['TZ']
+    return subprocess.run([TEST_TOOL_PATH] + test_args, shell=False, env=env).returncode
 
 
 def gmail_redirect_uri(local_port:int) -> str:
@@ -154,26 +214,22 @@ def gmail_get_token_from_code(client_id:str, client_secret:str, authorization_co
     return post_token_request(GOOGLE_OAUTH2_TOKEN_URL, params)
 
 
-def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:str, forward_url:str, input_dict:dict, state:str, code_verifier:str) -> type:
+def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:str, merge_existing:bool, state:str, code_verifier:str) -> type:
     class GMailRequestHandler(http.server.BaseHTTPRequestHandler):
         def log_request(self, code:Union[int,str]='-', size:Union[int,str]='-') -> None:
             # Silence request logging.
             return
 
         def do_GET(self) -> None:
+            # Only the redirect from Google is served. (The authorization URL,
+            # with its state and PKCE challenge, is only printed, never served:
+            # other local users could otherwise fetch it.)
             parse = urllib.parse.urlparse(self.path)
-            if parse.path == '/auth':
-              self.handle_initial_auth(parse)
-            elif parse.path == GOOGLE_OAUTH2_RESULT_PATH:
+            if parse.path == GOOGLE_OAUTH2_RESULT_PATH:
               self.handle_google_response(parse)
-
-        def handle_initial_auth(self, parse:urllib.parse.ParseResult) -> None:
-            if not forward_url:
-              print("No forwarding URL!", file=sys.stderr)
-              return
-            self.send_response(302)
-            self.send_header('Location', forward_url)
-            self.end_headers()
+            else:
+              self.send_response(404)
+              self.end_headers()
 
         def handle_google_response(self, parse:urllib.parse.ParseResult) -> None:
             qs = urllib.parse.parse_qs(parse.query)
@@ -220,31 +276,29 @@ def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:s
                     'refresh_token': token['refresh_token'],
                     'expiry': expiry_from_response(token),
                 }
-                dump_overwrite(token, output_filename, input_dict)
+                dump_overwrite(token, output_filename, merge_existing)
                 print(f"Wrote token to {output_filename}.", file=sys.stderr)
                 os._exit(0)
 
     return GMailRequestHandler
 
 
-def get_token_gmail(client_id:str, client_secret:str, scope:str, output_filename:str, local_listen_port:int, local_listen_address:str, input_dict:dict) -> None:
+def get_token_gmail(client_id:str, client_secret:str, scope:str, output_filename:str, local_listen_port:int, local_listen_address:str, merge_existing:bool) -> None:
     state = secrets.token_urlsafe(32)
     pkce = pkce_pair()
-    forward_url = gmail_get_auth_url(client_id, scope, local_listen_port, state, pkce['challenge'])
+    auth_url = gmail_get_auth_url(client_id, scope, local_listen_port, state, pkce['challenge'])
     request_handler_class = gmail_get_RequestHandler(
         client_id,
         client_secret,
         output_filename,
-        forward_url,
-        input_dict,
+        merge_existing,
         state,
         pkce['verifier'],
     )
     # Only reachable from this host by default (or through an SSH tunnel).
-    server = http.server.ThreadingHTTPServer((local_listen_address, local_listen_port), request_handler_class)
+    server = http.server.HTTPServer((local_listen_address, local_listen_port), request_handler_class)
 
-    url = f'http://127.0.0.1:{local_listen_port}/auth'
-    print(f"Please open this URL in a browser ON THIS HOST (or that has port {local_listen_port} forwarded to this host):\n\n{url}\n", file=sys.stderr)
+    print(f"Please open this URL in a browser ON THIS HOST (or one that has port {local_listen_port} forwarded to this host):\n\n{auth_url}\n", file=sys.stderr)
 
     server.serve_forever()
 
@@ -283,6 +337,8 @@ def outlook_get_cloud_config(cloud:str, login_base_override:Optional[str], scope
     if cloud not in OUTLOOK_CLOUD_CONFIGS:
         raise Exception(f"Unknown cloud '{cloud}'. Known clouds: {', '.join(OUTLOOK_CLOUD_CONFIGS.keys())}")
     config = dict(OUTLOOK_CLOUD_CONFIGS[cloud])
+    if login_base_override and not login_base_override.startswith('https://'):
+        raise Exception("--login-base must be an https:// URL.")
     if login_base_override:
         config["login_base"] = login_base_override
         if not scope_override:
@@ -382,6 +438,38 @@ def outlook_get_initial_tokens_by_device_flow(client_id:str, tenant:str, cloud_c
     }
 
 
+def outlook_client_credentials_with_certificate(client_id:str, tenant:str, cloud_config:Dict[str,str], mailbox:Optional[str], certificate:str, private_key:Optional[str]) -> Dict[str,Union[str,int]]:
+    """App-only access, authenticated with a certificate (recommended by
+    Microsoft over a client secret). The plugin signs a client assertion with
+    the private key for every token request; the key never leaves this host.
+
+    The token is not requested here; the plugin's own test (test-config) does
+    that once the file is written."""
+    certificate = os.path.abspath(certificate)
+    private_key = os.path.abspath(private_key) if private_key else certificate
+    for path in (certificate, private_key):
+        if not os.path.isfile(path):
+            raise Exception(f"No such file: {path}")
+    if stat.S_IMODE(os.stat(private_key).st_mode) & 0o077:
+        print(f"Warning: {private_key} is accessible to other users; "
+              f"restrict it (e.g. chmod 600) to the user the mail system runs as.",
+              file=sys.stderr)
+    tokens:Dict[str,Union[str,int]] = {
+        'grant_type': 'client_credentials',
+        'scope': cloud_config["app_scope"],
+        'token_endpoint': outlook_token_endpoint(tenant, cloud_config),
+        'client_id': client_id,
+        'client_certificate_file': certificate,
+        'access_token': '',
+        'expiry': 0,
+    }
+    if private_key != certificate:
+        tokens['client_private_key_file'] = private_key
+    if mailbox:
+        tokens['user'] = mailbox
+    return tokens
+
+
 def outlook_get_token_by_client_credentials(client_id:str, client_secret:str, tenant:str, cloud_config:Dict[str,str], mailbox:Optional[str]) -> Dict[str,Union[str,int]]:
     """App-only access (no user sign-in, no refresh token).
 
@@ -415,11 +503,20 @@ def outlook_get_token_by_client_credentials(client_id:str, client_secret:str, te
     return tokens
 
 
-def get_token_outlook(client_id:str, client_secret:Optional[str], tenant:str, flow:str, output_filename:str, input_dict:dict, cloud_config:Dict[str,str], mailbox:Optional[str]) -> None:
-    if flow == 'client-credentials':
+CLIENT_CREDENTIALS_KEYS = ('grant_type', 'scope', 'client_id', 'client_secret',
+                           'client_certificate_file', 'client_private_key_file')
+
+
+def get_token_outlook(client_id:str, client_secret:Optional[str], tenant:str, flow:str, output_filename:str, merge_existing:bool, cloud_config:Dict[str,str], mailbox:Optional[str], certificate:Optional[str] = None, private_key:Optional[str] = None) -> None:
+    removed_keys:tuple = ()
+    if flow == 'client-credentials' and certificate:
+        tokens = outlook_client_credentials_with_certificate(client_id, tenant, cloud_config, mailbox, certificate, private_key)
+        removed_keys = ('client_secret', 'refresh_token', 'client_private_key_file')
+    elif flow == 'client-credentials':
         if not client_secret:
-            raise Exception("The client credentials flow requires a client secret.")
+            raise Exception("The client credentials flow requires a client secret or a certificate.")
         tokens = outlook_get_token_by_client_credentials(client_id, client_secret, tenant, cloud_config, mailbox)
+        removed_keys = ('client_certificate_file', 'client_private_key_file', 'refresh_token')
     elif flow == 'device':
         tokens = outlook_get_initial_tokens_by_device_flow(client_id, tenant, cloud_config)
     else:
@@ -429,20 +526,35 @@ def get_token_outlook(client_id:str, client_secret:Optional[str], tenant:str, fl
         tokens = outlook_get_initial_tokens(client_id, client_secret, tenant, code, cloud_config, pkce['verifier'])
     if mailbox and 'user' not in tokens:
         tokens['user'] = mailbox
-    if flow != 'client-credentials' and input_dict.get('grant_type') == 'client_credentials':
-        # Switching an existing file back to delegated access: its app-only
-        # settings belong to the other application and must not be kept.
-        for key in ('grant_type', 'scope', 'client_id', 'client_secret'):
-            input_dict.pop(key, None)
-        print("Removed client credentials settings from the existing token file.", file=sys.stderr)
-    dump_overwrite(tokens, output_filename, input_dict)
-    if output_filename != '-':
-        print(f"Wrote token to {output_filename}.", file=sys.stderr)
+
+    def adjust(contents:dict) -> None:
+        for key in removed_keys:
+            if key not in tokens:
+                contents.pop(key, None)
+        if flow != 'client-credentials' and contents.get('grant_type') == 'client_credentials':
+            # Switching an existing file back to delegated access: its app-only
+            # settings belong to the other application and must not be kept.
+            for key in CLIENT_CREDENTIALS_KEYS:
+                if key not in tokens:
+                    contents.pop(key, None)
+            print("Removed client credentials settings from the existing token file.", file=sys.stderr)
+
+    dump_overwrite(tokens, output_filename, merge_existing, adjust)
+    if output_filename == '-':
+        return
+    print(f"Wrote token to {output_filename}.", file=sys.stderr)
+    if flow == 'client-credentials' and certificate:
+        if not os.path.exists(TEST_TOOL_PATH):
+            print("Run 'sasl-xoauth2-tool test-token-refresh' on the file to check it.", file=sys.stderr)
+            return
+        print("Requesting a token with the certificate to check the setup:", file=sys.stderr)
+        sys.exit(run_test_tool(['--token', output_filename]))
 
 ##########
 
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
 subparse = parser.add_subparsers()
 
 
@@ -451,15 +563,12 @@ def argparse_get_parser() -> argparse.ArgumentParser:
 
 
 def subcommand_get_token(args:argparse.Namespace) -> None:
-    input_dict = {}
     if args.overwrite_existing_token and args.output_file == '-':
         parser.error("--overwrite-existing-token needs an output file.")
-    if args.overwrite_existing_token:
-        if not os.path.isfile(args.output_file):
-            raise Exception("Cannot overwrite nonexistent token file {}".format(args.output_file))
-        else:
-            with open(args.output_file,'r') as input_file:
-                input_dict = json.load(input_file)
+    if args.overwrite_existing_token and not os.path.isfile(args.output_file):
+        raise Exception("Cannot overwrite nonexistent token file {}".format(args.output_file))
+    if (args.certificate or args.private_key) and not args.client_credentials:
+        parser.error("--certificate and --private-key are only used with --client-credentials.")
     if args.service == 'outlook':
         if not args.tenant:
             parser.error("'outlook' service requires 'tenant' argument.")
@@ -468,7 +577,7 @@ def subcommand_get_token(args:argparse.Namespace) -> None:
         flow = 'client-credentials' if args.client_credentials else ('device' if args.use_device_flow else 'auth-code')
         if flow == 'client-credentials' and args.tenant in ('consumers', 'common', 'organizations'):
             parser.error("--client-credentials requires --tenant=TENANT_ID (or the tenant's domain).")
-        if args.client_secret is None and flow != 'device':
+        if args.client_secret is None and flow != 'device' and not args.certificate:
             prompt = ('Please enter OAuth2 client secret: ' if flow == 'client-credentials' else
                       'Please enter OAuth2 client secret (leave empty for public clients): ')
             args.client_secret = getpass.getpass(prompt)
@@ -481,9 +590,11 @@ def subcommand_get_token(args:argparse.Namespace) -> None:
             args.tenant,
             flow,
             args.output_file,
-            input_dict,
+            args.overwrite_existing_token,
             cloud_config,
             args.mailbox,
+            args.certificate,
+            args.private_key,
         )
     elif args.service == 'gmail':
         if args.cloud != 'public' or args.login_base:
@@ -502,7 +613,7 @@ def subcommand_get_token(args:argparse.Namespace) -> None:
             args.output_file,
             args.local_listen_port,
             args.local_listen_address,
-            input_dict,
+            args.overwrite_existing_token,
         )
 
 
@@ -537,6 +648,17 @@ sp_get_token.add_argument(
     action='store_true',
     help="use the app-only client credentials flow for Outlook/Azure (no user "
          "sign-in, no refresh token); requires --tenant=TENANT_ID and a client secret",
+)
+sp_get_token.add_argument(
+    '--certificate',
+    help="with --client-credentials: authenticate with this certificate (PEM) "
+         "instead of a client secret (recommended); upload it to the app "
+         "registration under 'Certificates & secrets'",
+)
+sp_get_token.add_argument(
+    '--private-key',
+    help="with --certificate: the certificate's private key (PEM, "
+         "unencrypted), if not in the certificate file",
 )
 sp_get_token.add_argument(
     '--mailbox',
@@ -584,11 +706,10 @@ sp_get_token.add_argument(
 
 
 def subcommand_test_config(args:argparse.Namespace) -> None:
-  subprocess_args = [TEST_TOOL_PATH]
+  test_args = []
   if args.config_file:
-    subprocess_args.extend(['--config', args.config_file])
-  result = subprocess.run(subprocess_args, shell=False)
-  sys.exit(result.returncode)
+    test_args.extend(['--config', args.config_file])
+  sys.exit(run_test_tool(test_args))
 
 
 sp_test_config = subparse.add_parser('test-config', description='Tests a sasl-xoauth2 config file for syntax errors')
@@ -600,14 +721,19 @@ sp_test_config.add_argument(
 
 
 def subcommand_test_token_refresh(args:argparse.Namespace) -> None:
-  subprocess_args = [TEST_TOOL_PATH, '--token', args.token_file]
+  test_args = ['--token', args.token_file]
   if args.config_file:
-    subprocess_args.extend(['--config', args.config_file])
-  result = subprocess.run(subprocess_args, shell=False)
-  sys.exit(result.returncode)
+    test_args.extend(['--config', args.config_file])
+  sys.exit(run_test_tool(test_args))
 
 
-sp_test_token_refresh = subparse.add_parser('test-token-refresh', description='Tests that a token can be refreshed (i.e., that the OAuth 2 flow is working correctly)')
+sp_test_token_refresh = subparse.add_parser(
+    'test-token-refresh',
+    description='Tests that a token can be refreshed (i.e., that the OAuth 2 flow is working correctly). '
+                'The token file is not modified. Exit status: 0 on success, 1 on a transient failure '
+                '(e.g. network problem, provider outage), 2 on a failure that needs action (e.g. '
+                'invalid configuration, rejected token, unwritable token directory). Run it as the '
+                'user the mail system runs as (e.g. sudo -u postfix) to also check permissions.')
 sp_test_token_refresh.set_defaults(func=subcommand_test_token_refresh)
 sp_test_token_refresh.add_argument(
     '--config-file',

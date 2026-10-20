@@ -21,6 +21,7 @@
 #include <syslog.h>
 #include <time.h>
 
+#include <algorithm>
 #include <memory>
 
 namespace sasl_xoauth2 {
@@ -53,7 +54,7 @@ class SysLogLogger : public LogImpl {
   ~SysLogLogger() override = default;
 
   void WriteLine(const std::string &line) override {
-    syslog(LOG_WARNING, "[sasl-xoauth2] %s\n", line.c_str());
+    syslog(LOG_WARNING, "[sasl-xoauth2] %s", line.c_str());
   }
 };
 
@@ -87,10 +88,14 @@ std::string RedactSecret(const std::string &secret) {
   return "<redacted, " + std::to_string(secret.size()) + " bytes>";
 }
 
-std::string EscapeForLog(const std::string &value) {
+std::string EscapeForLog(const std::string &value, size_t max_length) {
   std::string out;
-  out.reserve(value.size());
+  out.reserve(std::min(value.size(), max_length));
   for (const unsigned char c : value) {
+    if (out.size() >= max_length) {
+      out += "...<" + std::to_string(value.size()) + " bytes>";
+      break;
+    }
     if (c < 0x20 || c == 0x7f || c == '\\') {
       char buf[8];
       snprintf(buf, sizeof(buf), "\\x%02x", c);
@@ -118,23 +123,43 @@ Log::~Log() {
   if (options_ & OPTIONS_FLUSH_ON_DESTROY) Flush();
 }
 
-void Log::Write(const char *fmt, ...) {
-  if (discard_) return;
+namespace {
 
-  va_list args;
-
-  va_start(args, fmt);
-  int buf_len = vsnprintf(nullptr, 0, fmt, args);
-  va_end(args);
-  if (buf_len < 0) return;
+std::string FormatV(const char *fmt, va_list args) {
+  va_list copy;
+  va_copy(copy, args);
+  const int buf_len = vsnprintf(nullptr, 0, fmt, copy);
+  va_end(copy);
+  if (buf_len < 0) return {};
 
   // +1 for the trailing \0, which is not part of the line.
   std::vector<char> buf(buf_len + 1);
-  va_start(args, fmt);
   vsnprintf(buf.data(), buf.size(), fmt, args);
-  va_end(args);
+  return std::string(buf.data(), buf_len);
+}
 
-  const std::string line(buf.data(), buf_len);
+}  // namespace
+
+void Log::Write(const char *fmt, ...) {
+  if (discard_) return;
+  va_list args;
+  va_start(args, fmt);
+  std::string line = FormatV(fmt, args);
+  va_end(args);
+  WriteLine(std::move(line), /*is_error=*/false);
+}
+
+void Log::Error(const char *fmt, ...) {
+  if (discard_) return;
+  va_list args;
+  va_start(args, fmt);
+  std::string line = FormatV(fmt, args);
+  va_end(args);
+  WriteLine(std::move(line), /*is_error=*/true);
+}
+
+void Log::WriteLine(std::string line, bool is_error) {
+  if (is_error) error_summary_ = line;
   if (options_ & OPTIONS_IMMEDIATE) {
     impl_->WriteLine(line);
   } else {
@@ -144,12 +169,14 @@ void Log::Write(const char *fmt, ...) {
 
 void Log::Flush() {
   if (lines_.empty()) return;
+  const std::string prefix =
+      std::string("auth failed (sasl-xoauth2 ") + SASL_XOAUTH2_VERSION + ")";
   if (options_ & OPTIONS_FULL_TRACE_ON_FAILURE) {
-    impl_->WriteLine("auth failed:");
+    impl_->WriteLine(prefix + ":");
     for (const auto &line : lines_) impl_->WriteLine("  " + line);
   } else {
     if (summary_.empty()) summary_ = lines_.back();
-    impl_->WriteLine("auth failed: " + summary_);
+    impl_->WriteLine(prefix + ": " + summary_);
     if (lines_.size() > 1) {
       impl_->WriteLine("set log_full_trace_on_failure to see full " +
                        std::to_string(lines_.size()) + " line(s) of tracing.");
@@ -159,7 +186,11 @@ void Log::Flush() {
 
 void Log::SetFlushOnDestroy() {
   options_ = static_cast<Options>(options_ | OPTIONS_FLUSH_ON_DESTROY);
-  if (!lines_.empty()) summary_ = lines_.back();
+  if (!error_summary_.empty()) {
+    summary_ = error_summary_;
+  } else if (!lines_.empty()) {
+    summary_ = lines_.back();
+  }
 }
 
 }  // namespace sasl_xoauth2
