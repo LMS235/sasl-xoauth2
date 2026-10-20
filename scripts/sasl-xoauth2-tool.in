@@ -682,9 +682,9 @@ sp_get_token.add_argument(
 )
 sp_get_token.add_argument(
     '--client-secret',
-    help="required for 'gmail' and for --client-credentials, optional for "
-         "other 'outlook' flows; will prompt the user if not given",
-)
+    help="required for 'gmail' and for --client-credentials without --certificate, "
+         "optional for other 'outlook' flows; prompted for if not given, which is preferable: "
+         "on the command line, it ends up in the shell history and is visible in ps")
 sp_get_token.add_argument(
     "--use-device-flow",
     default=False,
@@ -696,7 +696,7 @@ sp_get_token.add_argument(
     default=False,
     action='store_true',
     help="use the app-only client credentials flow for Outlook/Azure (no user "
-         "sign-in, no refresh token); requires --tenant=TENANT_ID and a client secret",
+         "sign-in, no refresh token); requires --tenant=TENANT_ID and a certificate (--certificate, recommended) or a client secret",
 )
 sp_get_token.add_argument(
     '--certificate',
@@ -738,11 +738,12 @@ sp_get_token.add_argument(
     '--overwrite-existing-token',
     default=False,
     action='store_true',
-    help='overwrite existing token file (preserves extra fields)',
+    help='merge into the existing token file, keeping its other fields (e.g. user); '
+         'without it, an existing file is replaced',
 )
 sp_get_token.add_argument(
     '--local-listen-port', type=int, default=54332,
-    help='port to launch local http listener on',
+    help="port of the local HTTP listener for 'gmail' (default: %(default)s)",
 )
 sp_get_token.add_argument(
     '--local-listen-address', default='127.0.0.1',
@@ -824,7 +825,7 @@ sp_test_token_refresh.add_argument(
 )
 sp_test_token_refresh.add_argument(
     'token_file',
-    help="file containing initial access token",
+    help="token file to test",
 )
 
 ##########

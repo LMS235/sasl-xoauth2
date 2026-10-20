@@ -27,7 +27,8 @@ https://github.com/LMS235/sasl-xoauth2
 
 # OPTIONS
 
-The top-level JSON object can contain the following keys:
+The top-level JSON object can contain the following keys. Boolean values are `yes`/`true` or `no`/`false` (in any case); numbers are integers, as JSON numbers or strings.
+If the file is missing, unreadable or invalid, the plugin does not load (and the mail agent cannot authenticate).
 
 `client_id`
 
@@ -75,7 +76,7 @@ The top-level JSON object can contain the following keys:
 
 `grant_type`
 
-: how access tokens are obtained: `refresh_token` (default; the token file must contain a refresh token) or `client_credentials` (app-only access with client ID and secret, e.g. Microsoft 365 with the `SMTP.SendAsApp` permission; requires `scope`)
+: how access tokens are obtained: `refresh_token` (default; the token file must contain a refresh token) or `client_credentials` (app-only access with a client certificate or client secret, e.g. Microsoft 365 with the `SMTP.SendAsApp` permission; requires `scope`)
 
 `scope`
 
@@ -96,6 +97,7 @@ The token file is also JSON-formatted.
 The contents of this token file MAY contain values for the keys described above (except for the logging-related keys).
 If they do, the value in the token file overrides the value in the main configuration file.
 
+Its own keys are `refresh_token` (required for `grant_type` `refresh_token`), `access_token` (the current access token) and `expiry` (when it expires, in seconds since the epoch, as a string or number; an invalid value is ignored and the token refreshed).
 It may additionally contain `user`, which overrides the user name sent to the server (with `client_credentials`, the mailbox address; for a shared mailbox, its address).
 A token file that sets a different `token_endpoint`, `proxy`, `ca_bundle_file` or `ca_certs_dir` than this file must also set its own `client_secret` (or use a certificate); the `client_secret` from this file is not sent there.
 
@@ -103,7 +105,7 @@ This makes it possible to use the same installation of `sasl-xoauth2` to connect
 This also has the benefit of providing storage for client secrets that is not world-readable.
 
 Token files are updated atomically (a new file is written and renamed into place).
-The new file belongs to the user that writes it (normally the mail agent's user), keeps the owner and group permission bits of the previous file, and never grants access to other users.
+The new file belongs to the user that writes it (normally the mail agent's user; when written by root, e.g. by `sasl-xoauth2-tool refresh-token`, it keeps the previous file's owner and group), keeps the owner and group permission bits of the previous file, and never grants access to other users.
 Refreshes are serialized between processes with a lock file named after the token file plus `.lock`, so the directory containing the token file must be writable by the mail agent.
 If the new token cannot be stored, it is used anyway and an error is logged; if a refresh fails while the current token is still valid for at least a minute, the current token is used.
 

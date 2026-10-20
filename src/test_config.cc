@@ -22,14 +22,16 @@ struct Options {
   std::string config_path;
   std::string token_path;
   bool update = false;
+  bool help = false;
 };
 
 bool TryParseCommandLine(int argc, char **argv, Options *out) {
-  const char *kShortOptions = "c:r:uvV";
+  const char *kShortOptions = "c:r:uvVh";
   const option kLongOptions[] = {{"config", required_argument, nullptr, 'c'},
                                  {"token", required_argument, nullptr, 'r'},
                                  {"update", no_argument, nullptr, 'u'},
                                  {"version", no_argument, nullptr, 'V'},
+                                 {"help", no_argument, nullptr, 'h'},
                                  {nullptr, 0, nullptr, 0}};
 
   while (true) {
@@ -47,6 +49,10 @@ bool TryParseCommandLine(int argc, char **argv, Options *out) {
 
       case 'u':
         out->update = true;
+        break;
+
+      case 'h':
+        out->help = true;
         break;
 
       case 'v':
@@ -75,7 +81,8 @@ void PrintUsage(const std::string &base_name) {
           "                       token file (also renews a rotating refresh\n"
           "                       token, e.g. Microsoft's); for a scheduled\n"
           "                       daily refresh\n"
-          "  -V, -v, --version    print the version and exit\n\n"
+          "  -V, -v, --version    print the version and exit\n"
+          "  -h, --help           print this help and exit\n\n"
           "Exit status: 0 on success, 1 on a transient failure (e.g. network\n"
           "problem or provider outage), 2 on a failure that needs action\n"
           "(e.g. invalid configuration, rejected token, unwritable token\n"
@@ -90,6 +97,10 @@ Options ParseCommandLine(int argc, char **argv) {
   if (!TryParseCommandLine(argc, argv, &parsed_options)) {
     PrintUsage(base_name);
     exit(kExitPermanent);
+  }
+  if (parsed_options.help) {
+    PrintUsage(base_name);
+    exit(kExitOk);
   }
 
   return parsed_options;

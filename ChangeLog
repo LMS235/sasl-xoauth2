@@ -61,7 +61,9 @@ sasl-xoauth2 (0.29) unstable; urgency=medium
     stores a new token, under the plugin's lock; meant to run daily from a
     systemd timer or cron, keeping unused refresh tokens alive. Token and
     lock files keep their owner when written as root.
-  * README: upgrade notes for 0.29, daily token refresh.
+  * README: upgrade notes for 0.29, daily token refresh. On Ubuntu 26.04,
+    replace the previously recommended ProtectSystem=true for Postfix with
+    ReadWritePaths=-/etc/tokens (see "Upgrading to 0.29").
   * sasl-xoauth2-tool --version (-v, -V) shows the versions and paths of
     the tool, its helper and the installed plugin, and warns about a mix of
     versions; the help lists the commands and the version.
