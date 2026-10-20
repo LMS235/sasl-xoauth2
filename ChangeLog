@@ -30,6 +30,7 @@ sasl-xoauth2 (0.29) unstable; urgency=medium
     system, copies symlink targets and skips dangling symlinks.
   * Never terminate the host process from within the plugin.
   * -DEnableTests=OFF no longer builds the test program.
+  * Installing no longer overwrites an existing /etc/sasl-xoauth2.conf.
   * README: build instructions for Ubuntu 26.04 LTS; both Microsoft 365
     ways (delegated, app-only) described side by side.
 
