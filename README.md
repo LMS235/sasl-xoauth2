@@ -105,50 +105,13 @@ above.
 ### Other Distributions
 
 The same steps work on other distributions with the equivalent packages (on
-Debian and older Ubuntu releases the package names above are the same). The
-[Debian packaging](https://github.com/tarickb/sasl-xoauth2/blob/packaging/ubuntu/debian/control)
-lists the dependencies as well.
+Debian and older Ubuntu releases the package names above are the same).
 
-## Pre-Built Packages for Ubuntu
-
-Add the [sasl-xoauth2 PPA](https://launchpad.net/~sasl-xoauth2/+archive/ubuntu/stable):
-
-```
-$ sudo add-apt-repository ppa:sasl-xoauth2/stable
-$ sudo apt-get update
-```
-
-Install the plugin:
-
-```
-$ sudo apt-get install sasl-xoauth2
-```
-
-## Pre-Built Packages for RHEL/EPEL/Fedora
-
-The package is now available in latest Fedora and EPEL8/9. You can see how to enable epel here:
-
-https://docs.fedoraproject.org/en-US/epel/
-
-After that just install the plugin as any other package:
-
-```
-$ sudo dnf install sasl-xoauth2
-```
-
-(Thank you [@augustus-p](https://github.com/augustus-p) for confirming that
-this works!)
-
-For older Fedora versions, you can use the [sasl-xoauth2 Copr
-repository](https://copr.fedorainfracloud.org/coprs/jjelen/sasl-xoauth2/):
-
-```
-$ sudo dnf copr enable jjelen/sasl-xoauth2
-```
+## System-Specific Notes
 
 ### A Note on SELinux
 
-If SELinux is enabled, you may find that authentication is failing. This is
+If SELinux is enabled (e.g. on RHEL or Fedora), you may find that authentication is failing. This is
 likely because the sasl-xoauth2 plugin, running within the Postfix `smtp`
 process, is unable to read, write, or create a new token file. If in doubt,
 check your SELinux audit logs.
@@ -326,12 +289,13 @@ $ sudo mkdir -p /var/spool/postfix/etc/ssl/certs
 $ sudo cp /etc/ssl/certs/ca-certificates.crt /var/spool/postfix/etc/ssl/certs/ca-certificates.crt
 ```
 
-The Debian and Ubuntu packages install a script that is automatically run by
-`update-ca-certificates` to ensure the certificates are copied whenever the
-system certificates are updated:
-`/etc/ca-certificates/update.d/postfix-sasl-xoauth2-update-ca-certs`. It is also
-run when the package is installed. The script replaces the chroot copy as a
-whole, so certificates removed from the system are removed from the chroot too.
+sasl-xoauth2 includes a script,
+`scripts/postfix-sasl-xoauth2-update-ca-certs`, that copies the certificates
+into the chroot. Installed as a hook in `/etc/ca-certificates/update.d/` (see
+[Ubuntu 26.04 LTS](#ubuntu-2604-lts) under Building from Source), it is run by
+`update-ca-certificates` whenever the system certificates change. The script
+replaces the chroot copy as a whole, so certificates removed from the system
+are removed from the chroot too.
 
 Token endpoints must use `https://`; sasl-xoauth2 does not send credentials over
 plain HTTP and does not follow redirects. Requests time out after 10 seconds
@@ -386,8 +350,8 @@ We'll also need these credentials in the next step.
 
 #### Initial Access Token
 
-The sasl-xoauth2 package includes a script that can assist in the generation of
-Gmail OAuth tokens. Run the script as follows:
+`sasl-xoauth2-tool`, which is installed along with the plugin, can assist in
+the generation of Gmail OAuth tokens. Run the script as follows:
 
 ```shell
 $ sasl-xoauth2-tool get-token gmail \
@@ -999,53 +963,5 @@ Postfix's logging level, following the instructions
 
 If Postfix complains about not finding a SASL mechanism (along the lines of
 `warning: SASL authentication failure: No worthy mechs found`), it's possible
-that either `make install` or the pre-built package put libsasl-xoauth2.so in
-the wrong directory.
-
-## Building
-
-sasl-xoauth2 uses [git-buildpackage](https://github.com/agx/git-buildpackage)
-for Debian and Ubuntu builds. The following is mostly intended as a cheat-sheet.
-
-### Creating a New Distribution Branch for an Existing Release
-
-```
-$ TARGET_DIST=dist-name # debian, ubuntu, etc.
-$ TARGET_DIST_RELEASE=release-name # focal, jammy, etc.
-$ RELEASE=0.NN
-$ RELEASE_VERSION="$RELEASE-1ubuntu1~${TARGET_DIST_RELEASE}1~ppa1"
-$ git clone --no-checkout -o upstream git@github.com:tarickb/sasl-xoauth2.git
-$ cd sasl-xoauth2
-$ git checkout -b "$TARGET_DIST/$TARGET_DIST_RELEASE" "release-$RELEASE"
-$ git checkout "upstream/packaging/$TARGET_DIST" debian/
-$ dch --create --package "sasl-xoauth2" --newversion "$RELEASE_VERSION" \
-    --distribution "$TARGET_DIST_RELEASE"
-$ git add debian/
-$ git commit -m \
-    "Initial packaging commit for $TARGET_DIST/$TARGET_DIST_RELEASE." debian/
-```
-
-### Updating an Existing Release Branch for a New Release
-
-```
-$ TARGET_DIST=dist-name # debian, ubuntu, etc.
-$ TARGET_DIST_RELEASE=release-name # focal, jammy, etc.
-$ RELEASE=0.NN
-$ RELEASE_VERSION="$RELEASE-1ubuntu1~${TARGET_DIST_RELEASE}1~ppa1"
-$ git fetch upstream
-$ git checkout "$TARGET_DIST/$TARGET_DIST_RELEASE"
-$ git merge "release-$RELEASE"
-$ gbp dch --release --auto --debian-branch="$TARGET_DIST/$TARGET_DIST_RELEASE" \
-    -N "$RELEASE_VERSION" --distribution="$TARGET_DIST_RELEASE"
-$ git commit -m "Release $RELEASE_VERSION" debian/changelog
-```
-
-### Building and Uploading a Release
-
-```
-$ TARGET_DIST=dist-name # debian, ubuntu, etc.
-$ TARGET_DIST_RELEASE=release-name # focal, jammy, etc.
-$ gbp buildpackage --git-debian-branch="$TARGET_DIST/$TARGET_DIST_RELEASE" \
-    -S --git-tag
-$ dput ppa:sasl-xoauth2/stable build/*.changes
-```
+`make install` put libsasl-xoauth2.so in the wrong directory (see the
+installation paths under [Building from Source](#building-from-source)).
