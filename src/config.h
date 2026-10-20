@@ -27,6 +27,10 @@ namespace sasl_xoauth2 {
 constexpr char kGrantTypeRefreshToken[] = "refresh_token";
 constexpr char kGrantTypeClientCredentials[] = "client_credentials";
 
+// Access tokens from Google and Microsoft live about an hour; a refresh window
+// close to that would request a new token for every connection.
+constexpr int kMaxRefreshWindow = 1800;  // seconds
+
 class Config {
  public:
   static void EnableLoggingToStderr();
@@ -50,6 +54,7 @@ class Config {
   const std::string &scope() const { return scope_; }
 
   static bool IsValidGrantType(const std::string &grant_type);
+  static bool IsValidRefreshWindow(int refresh_window);
 
  private:
   Config() = default;

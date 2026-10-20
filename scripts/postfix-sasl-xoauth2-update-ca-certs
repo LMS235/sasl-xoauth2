@@ -10,15 +10,27 @@ fi
 dest=/var/spool/postfix/etc/ssl
 mkdir -p "$dest"
 
-# Build the new copy next to the old one, then swap it in, so that the chroot
-# never sees a half-copied directory and certificates removed from the system
-# (e.g. distrusted CAs) disappear from the chroot as well.
+# Build the new copy next to the old one and only then swap it in, so that
+# certificates removed from the system (e.g. distrusted CAs) disappear from the
+# chroot as well, and a failed copy leaves the old certificates in place.
 tmp=$(mktemp -d "$dest/.certs.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
-# -L: /etc/ssl/certs is mostly symlinks into /usr/share/ca-certificates, which
-# does not exist inside the chroot; copy what they point to.
-cp -RL /etc/ssl/certs/. "$tmp/"
+# /etc/ssl/certs is mostly symlinks into /usr/share/ca-certificates, which does
+# not exist inside the chroot: copy what they point to (-L). Skip dangling
+# symlinks rather than failing.
+for entry in /etc/ssl/certs/* /etc/ssl/certs/.[!.]*; do
+    if [ ! -e "$entry" ]; then
+        [ -L "$entry" ] && echo "Skipping dangling symlink $entry" >&2
+        continue
+    fi
+    cp -RL "$entry" "$tmp/"
+done
+
+if [ ! -s "$tmp/ca-certificates.crt" ]; then
+    echo "No ca-certificates.crt in /etc/ssl/certs, keeping existing chroot copy" >&2
+    exit 0
+fi
 chmod 755 "$tmp"
 
 rm -rf "$dest/certs.old"

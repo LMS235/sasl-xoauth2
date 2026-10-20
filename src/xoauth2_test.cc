@@ -725,6 +725,14 @@ bool TestFailedPreemptiveTokenRefresh(sasl_client_plug_t plug) {
   return true;
 }
 
+bool TestEscapeForLog() {
+  PrintTestName(__func__);
+  TEST_ASSERT(sasl_xoauth2::EscapeForLog("user@example.com") ==
+              "user@example.com");
+  TEST_ASSERT(sasl_xoauth2::EscapeForLog("a\nb\1c\\") == "a\\x0ab\\x01c\\x5c");
+  return true;
+}
+
 bool TestRedactSecret() {
   PrintTestName(__func__);
   TEST_ASSERT(sasl_xoauth2::RedactSecret("") == "<empty>");
@@ -847,12 +855,13 @@ bool TestRequestIsFormEncoded() {
   TEST_ASSERT(store != nullptr);
   TEST_ASSERT_OK(store->Refresh());
   fprintf(stderr, "request=[%s]\n", endpoint.last_request.c_str());
+  // The scope is only sent for client credentials; refresh token requests
+  // get the originally granted scopes (older tools put Google's "scope" into
+  // token files).
   TEST_ASSERT(endpoint.last_request ==
               "grant_type=refresh_token&client_id=dummy%20client%20id"
               "&client_secret=s~e%2Bc%26r%3De%2Ft"
-              "&refresh_token=0.AX%2By%2Fz%3D"
-              "&scope=offline_access%20https%3A%2F%2Foutlook.office.com%2F"
-              "SMTP.Send");
+              "&refresh_token=0.AX%2By%2Fz%3D");
   return true;
 }
 
@@ -959,6 +968,10 @@ bool TestInvalidTokenFilesRejected() {
 
   SetPasswordToTokenFile(R"({"refresh_token": "r", "refresh_window": "-1"})");
   TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
+
+  // A window as long as the token lifetime would refresh on every connection.
+  SetPasswordToTokenFile(R"({"refresh_token": "r", "refresh_window": "3600"})");
+  TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
   return true;
 }
 
@@ -1063,6 +1076,7 @@ bool TestControlCharacterInUserRejected(sasl_client_plug_t plug) {
 int main(int argc, char **argv) {
   sasl_xoauth2::EnableLoggingForTesting();
   TEST_ABORT(TestRedactSecret());
+  TEST_ABORT(TestEscapeForLog());
 
   Json::Value config;
   config["client_id"] = "dummy client id";

@@ -29,6 +29,10 @@ void EnableLoggingForTesting();
 // so a trace still shows whether a value was present without revealing it.
 std::string RedactSecret(const std::string &secret);
 
+// Escapes control characters (as \xNN) in values that come from outside, so
+// they cannot forge or split log lines.
+std::string EscapeForLog(const std::string &value);
+
 // Log implementation interface, not for direct use.
 class LogImpl {
  public:

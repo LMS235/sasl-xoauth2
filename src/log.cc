@@ -87,6 +87,21 @@ std::string RedactSecret(const std::string &secret) {
   return "<redacted, " + std::to_string(secret.size()) + " bytes>";
 }
 
+std::string EscapeForLog(const std::string &value) {
+  std::string out;
+  out.reserve(value.size());
+  for (const unsigned char c : value) {
+    if (c < 0x20 || c == 0x7f || c == '\\') {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "\\x%02x", c);
+      out += buf;
+    } else {
+      out.push_back(static_cast<char>(c));
+    }
+  }
+  return out;
+}
+
 void EnableLoggingForTesting() {
   s_default_options = Log::OPTIONS_IMMEDIATE;
   s_default_target = Log::TARGET_STDERR;

@@ -90,6 +90,10 @@ class FileLock {
 
   bool Acquire(Log *log, const std::string &path) {
     fd_ = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    // flock() works on read-only descriptors too, e.g. for a lock file that
+    // another user created.
+    if (fd_ < 0 && errno == EACCES)
+      fd_ = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd_ < 0) {
       log->Write("FileLock: unable to open %s: %s", path.c_str(),
                  strerror(errno));
@@ -175,8 +179,14 @@ int WriteFileAtomically(Log *log, const std::string &path,
   }
   if (have_existing && existing.st_gid != getegid() &&
       fchown(fd, static_cast<uid_t>(-1), existing.st_gid) != 0) {
+    // The new file belongs to a different group, which must not inherit the
+    // old group's access.
     log->Write("TokenStore::Write: unable to keep group of %s: %s",
                path.c_str(), strerror(errno));
+    if (fchmod(fd, mode & ~S_IRWXG) != 0) {
+      log->Write("TokenStore::Write: unable to set mode of %s: %s",
+                 temp_path.c_str(), strerror(errno));
+    }
   }
   bool ok = WriteAll(fd, contents) && fsync(fd) == 0;
   int saved_errno = errno;
@@ -329,7 +339,11 @@ int TokenStore::Refresh() {
     request += "&client_secret=" + FormUrlEncode(client_secret);
   if (grant_type == kGrantTypeRefreshToken)
     request += "&refresh_token=" + FormUrlEncode(refresh_);
-  if (!scope.empty()) request += "&scope=" + FormUrlEncode(scope);
+  // The scope is needed (only) to request app-only tokens. Refresh token
+  // requests leave it out and get the scopes originally granted; this also
+  // ignores the "scope" field older tools copied into Gmail token files.
+  const bool send_scope = (grant_type == kGrantTypeClientCredentials);
+  if (send_scope) request += "&scope=" + FormUrlEncode(scope);
 
   std::string response;
   long response_code = 0;
@@ -342,7 +356,7 @@ int TokenStore::Refresh() {
       RedactSecret(client_secret).c_str(),
       grant_type == kGrantTypeRefreshToken ? RedactSecret(refresh_).c_str()
                                            : "<not sent>",
-      scope.empty() ? "<not sent>" : scope.c_str());
+      send_scope ? scope.c_str() : "<not sent>");
 
   std::string http_error;
   int err = HttpPost({.url = token_endpoint,
@@ -388,6 +402,12 @@ int TokenStore::Refresh() {
     if (expiry_sec <= 0) {
       log_->Write("TokenStore::Refresh: invalid expiry");
       return SASL_BADPROT;
+    }
+    if (expiry_sec <= RefreshWindow()) {
+      log_->Write(
+          "TokenStore::Refresh: token lifetime (%lld s) is not longer than "
+          "refresh_window (%d s); every connection will request a new token",
+          expiry_sec, RefreshWindow());
     }
     access_ = access_token;
     if (root.isMember("refresh_token")) {
@@ -452,8 +472,9 @@ int TokenStore::Read() {
     std::optional<int> refresh_window;
     if (root.isMember("refresh_window")) {
       refresh_window = stoi(root["refresh_window"].asString());
-      if (*refresh_window < 0) {
-        log_->Write("TokenStore::Read: negative refresh_window");
+      if (!Config::IsValidRefreshWindow(*refresh_window)) {
+        log_->Write("TokenStore::Read: refresh_window out of range (0-%d)",
+                    kMaxRefreshWindow);
         return SASL_FAIL;
       }
       if (*refresh_window == 0) {
@@ -496,7 +517,8 @@ int TokenStore::Read() {
     log_->Write(
         "TokenStore::Read: grant_type=%s, refresh=%s, access=%s, user=%s",
         effective_grant_type.c_str(), RedactSecret(refresh_).c_str(),
-        RedactSecret(access_).c_str(), user_.value_or("").c_str());
+        RedactSecret(access_).c_str(),
+        EscapeForLog(user_.value_or("")).c_str());
     return SASL_OK;
 
   } catch (const std::exception &e) {

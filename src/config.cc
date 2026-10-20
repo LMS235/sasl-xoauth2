@@ -22,7 +22,9 @@
 #include <syslog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <memory>
 #include <sstream>
 
 namespace sasl_xoauth2 {
@@ -122,8 +124,11 @@ int Config::Init(std::string path) {
 
     Json::Value root;
     f >> root;
-    s_config = new Config();
-    return s_config->Init(root);
+    // Only a fully valid config counts as initialized.
+    std::unique_ptr<Config> config(new Config());
+    const int err = config->Init(root);
+    if (err == SASL_OK) s_config = config.release();
+    return err;
 
   } catch (const std::exception &e) {
     Log("sasl-xoauth2: Exception during init: %s\n", e.what());
@@ -137,8 +142,10 @@ int Config::InitForTesting(const Json::Value &root) {
     exit(1);
   }
 
-  s_config = new Config();
-  return s_config->Init(root);
+  std::unique_ptr<Config> config(new Config());
+  const int err = config->Init(root);
+  if (err == SASL_OK) s_config = config.release();
+  return err;
 }
 
 Config *Config::Get() {
@@ -150,6 +157,10 @@ Config *Config::Get() {
     return &s_fallback;
   }
   return s_config;
+}
+
+/* static */ bool Config::IsValidRefreshWindow(int refresh_window) {
+  return refresh_window >= 0 && refresh_window <= kMaxRefreshWindow;
 }
 
 /* static */ bool Config::IsValidGrantType(const std::string &grant_type) {
@@ -184,8 +195,9 @@ int Config::Init(const Json::Value &root) {
 
     err = Fetch(root, "refresh_window", true, &refresh_window_);
     if (err != SASL_OK) return err;
-    if (refresh_window_ < 0) {
-      Log("sasl-xoauth2: refresh_window must not be negative.\n");
+    if (!IsValidRefreshWindow(refresh_window_)) {
+      Log("sasl-xoauth2: refresh_window must be between 0 and %d seconds.\n",
+          kMaxRefreshWindow);
       return SASL_FAIL;
     }
 

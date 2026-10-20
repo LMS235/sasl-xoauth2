@@ -67,7 +67,7 @@ The top-level JSON object can contain the following keys:
 
 `refresh_window`
 
-: request a new access token this many seconds before the current one expires (integer, defaults to 300); Microsoft's HVE endpoint needs at least 600.
+: request a new access token this many seconds before the current one expires (integer from 0 to 1800, defaults to 300); Microsoft's HVE endpoint needs at least 600.
   In a token file, a value of 0 is ignored (versions before 0.29 wrote it there by mistake).
 
 `grant_type`
@@ -76,7 +76,7 @@ The top-level JSON object can contain the following keys:
 
 `scope`
 
-: if set, sent as the `scope` of token requests; required for `client_credentials` (for Microsoft 365: `https://outlook.office365.com/.default`)
+: the `scope` of `client_credentials` token requests, and required for them (for Microsoft 365: `https://outlook.office365.com/.default`); not sent for `refresh_token` requests, which keep the originally granted scopes
 
 # TOKEN FILE
 
@@ -90,7 +90,8 @@ It may additionally contain `user`, which overrides the user name sent to the se
 This makes it possible to use the same installation of `sasl-xoauth2` to connect to two different providers simultaneously.
 This also has the benefit of providing storage for client secrets that is not world-readable.
 
-Token files are updated atomically (a new file is written and renamed into place), keeping the owner and group permission bits of the previous file but never permissions for other users.
+Token files are updated atomically (a new file is written and renamed into place).
+The new file belongs to the user that writes it (normally the mail agent's user), keeps the owner and group permission bits of the previous file, and never grants access to other users.
 Refreshes are serialized between processes with a lock file named after the token file plus `.lock`, so the directory containing the token file must be writable by the mail agent.
 
 # BUGS

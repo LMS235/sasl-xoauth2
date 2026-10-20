@@ -33,7 +33,8 @@ void ReadPrompt(Log *log, sasl_interact_t **prompts, const unsigned int id,
   for (const auto *p = *prompts; p->id != SASL_CB_LIST_END; ++p) {
     if (p->id == id) {
       value->assign(static_cast<const char *>(p->result), p->len);
-      log->Write("ReadPrompt: found id %d with value [%s]", id, value->c_str());
+      log->Write("ReadPrompt: found id %u with value [%s]", id,
+                 EscapeForLog(*value).c_str());
       return;
     }
   }
@@ -250,14 +251,16 @@ int Client::TokenSentStep(sasl_client_params_t *params,
   *to_server = nullptr;
   *to_server_len = 0;
 
+  if (from_server_len == 0 || !from_server) {
+    log_->Write("Client::TokenSentStep: empty response from server");
+    return SASL_OK;
+  }
+
   // from_server is from_server_len bytes and need not be NUL-terminated.
-  log_->Write("Client::TokenSentStep: from server: %.*s",
-              static_cast<int>(from_server_len),
-              from_server ? from_server : "");
+  const std::string from_server_str(from_server, from_server_len);
+  log_->Write("Client::TokenSentStep: from server: %s",
+              EscapeForLog(from_server_str).c_str());
 
-  if (from_server_len == 0) return SASL_OK;
-
-  std::string from_server_str(from_server, from_server_len);
   std::stringstream stream(from_server_str);
   std::string status;
 
@@ -281,7 +284,8 @@ int Client::TokenSentStep(sasl_client_params_t *params,
     return SASL_OK;
   }
 
-  log_->Write("Client::TokenSentStep: status: %s", status.c_str());
+  log_->Write("Client::TokenSentStep: status: %s",
+              EscapeForLog(status).c_str());
   return SASL_BADPROT;
 }
 
@@ -302,8 +306,8 @@ int Client::SendToken(const char **to_server, unsigned int *to_server_len) {
   }
 
   response_ = "user=" + user_ + "\1auth=Bearer " + token + "\1\1";
-  log_->Write("Client::SendToken: user=%s, token=%s", user_.c_str(),
-              RedactSecret(token).c_str());
+  log_->Write("Client::SendToken: user=%s, token=%s",
+              EscapeForLog(user_).c_str(), RedactSecret(token).c_str());
 
   *to_server = response_.data();
   *to_server_len = response_.size();

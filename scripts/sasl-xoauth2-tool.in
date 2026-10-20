@@ -94,13 +94,24 @@ def dump_overwrite(token:dict, output_filename:str, input_dict:dict):
     # keep the owner/group bits of the file it replaces), and replace it
     # atomically so a failure never leaves a truncated token file behind.
     mode = 0o600
+    existing = None
     try:
-        mode |= stat.S_IMODE(os.stat(output_filename).st_mode) & 0o770
+        existing = os.stat(output_filename)
+        mode |= stat.S_IMODE(existing.st_mode) & 0o770
     except FileNotFoundError:
         pass
     directory = os.path.dirname(os.path.abspath(output_filename))
     fd, temp_path = tempfile.mkstemp(dir=directory, prefix='.sasl-xoauth2-')
     try:
+        if existing:
+            # Keep the file usable by its owner (e.g. Postfix) when updated by
+            # another user (e.g. root).
+            try:
+                os.fchown(fd, existing.st_uid, existing.st_gid)
+            except PermissionError:
+                print(f"Warning: could not keep owner of {output_filename}; check its ownership.",
+                      file=sys.stderr)
+                mode &= 0o700
         os.fchmod(fd, mode)
         with os.fdopen(fd, 'w') as output_file:
             json.dump(input_dict, output_file, indent=4)
@@ -203,7 +214,12 @@ def gmail_get_RequestHandler(client_id:str, client_secret:str, output_filename:s
                 if 'refresh_token' not in token:
                     print("Response contains no refresh token.", file=sys.stderr)
                     os._exit(1)
-                token['expiry'] = expiry_from_response(token)
+                # Store only what the plugin uses.
+                token = {
+                    'access_token': token['access_token'],
+                    'refresh_token': token['refresh_token'],
+                    'expiry': expiry_from_response(token),
+                }
                 dump_overwrite(token, output_filename, input_dict)
                 print(f"Wrote token to {output_filename}.", file=sys.stderr)
                 os._exit(0)
@@ -413,6 +429,12 @@ def get_token_outlook(client_id:str, client_secret:Optional[str], tenant:str, fl
         tokens = outlook_get_initial_tokens(client_id, client_secret, tenant, code, cloud_config, pkce['verifier'])
     if mailbox and 'user' not in tokens:
         tokens['user'] = mailbox
+    if flow != 'client-credentials' and input_dict.get('grant_type') == 'client_credentials':
+        # Switching an existing file back to delegated access: its app-only
+        # settings belong to the other application and must not be kept.
+        for key in ('grant_type', 'scope', 'client_id', 'client_secret'):
+            input_dict.pop(key, None)
+        print("Removed client credentials settings from the existing token file.", file=sys.stderr)
     dump_overwrite(tokens, output_filename, input_dict)
     if output_filename != '-':
         print(f"Wrote token to {output_filename}.", file=sys.stderr)
@@ -607,11 +629,7 @@ def main() -> None:
                       'module is not installed. '
                       'Maybe you want to "apt install python3-argcomplete"')
         sys.exit(1)
-    try:
-      args = parser.parse_intermixed_args()
-    except TypeError:
-      # parse_intermixed_args() does not support subparsers on older Pythons.
-      args = parser.parse_args()
+    args = parser.parse_args()
     if hasattr(args, 'func'):
       args.func(args)
     else:
