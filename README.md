@@ -55,7 +55,7 @@ Install MSAL from the Ubuntu archive as shown: Ubuntu does not allow
 Then build, test and install:
 
 ```
-$ git clone https://github.com/tarickb/sasl-xoauth2.git
+$ git clone https://github.com/LMS235/sasl-xoauth2.git
 $ cd sasl-xoauth2
 $ cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/etc
 $ cmake --build build -j"$(nproc)"
@@ -328,7 +328,7 @@ Once you are logged into your Gmail account in the browser, all these steps happ
 
 - Set up "OAuth Consent Screen" for the project
 
-  - If this is an "External" app, make sure the "Publishing status" of the app is set to "In production" (as opposed to "Testing"), otherwise the token [will be revoked after 7 days](https://github.com/tarickb/sasl-xoauth2/issues/29).
+  - If this is an "External" app, make sure the "Publishing status" of the app is set to "In production" (as opposed to "Testing"), otherwise the token [will be revoked after 7 days](https://github.com/tarickb/sasl-xoauth2/issues/29) (upstream issue).
     - You can ignore any requests to "verify" your app. The warnings shown in the console are misleading. You don't actually need to go through verification.
 
 #### Client Credentials
@@ -522,7 +522,7 @@ in the Microsoft Entra admin center:
 * Use any name you like (it doesn't have to be "sasl-xoauth2").
 * Select the appropriate type of account: "Accounts in this organizational
   directory only" for a Microsoft 365 tenant, or personal Microsoft accounts
-  for outlook.com (see [#89](https://github.com/tarickb/sasl-xoauth2/issues/89)
+  for outlook.com (see upstream issue [#89](https://github.com/tarickb/sasl-xoauth2/issues/89)
   for why this matters).
 * Do **not** add any redirect URIs or set up any platform configurations.
 * Under "Authentication", you **must** set "Allow public client flows" to
@@ -655,7 +655,7 @@ Wrote token to /etc/tokens/relay@contoso.com.
 After signing in you are redirected to a blank page; copy its URL into the
 terminal. The tool protects the exchange with a random `state` and PKCE.
 
-Some users have [reported](https://github.com/tarickb/sasl-xoauth2/issues/61)
+Some users have [reported](https://github.com/tarickb/sasl-xoauth2/issues/61) (upstream issue)
 needing a client secret with this variant, for applications registered for
 "accounts in any organizational directory". In that case, enter the secret when
 prompted and also set it as `client_secret` in `/etc/sasl-xoauth2.conf` (or in

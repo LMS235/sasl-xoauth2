@@ -20,7 +20,7 @@ A minimal configuration file looks like:
 ```
 
 See the full README for guidance on initial configuration:
-https://github.com/tarickb/sasl-xoauth2
+https://github.com/LMS235/sasl-xoauth2
 
 # OPTIONS
 
@@ -96,7 +96,7 @@ Refreshes are serialized between processes with a lock file named after the toke
 
 # BUGS
 
-Please report improvements in this documentation upstream at https://github.com/tarickb/sasl-xoauth2/issues
+Please report improvements in this documentation at https://github.com/LMS235/sasl-xoauth2/issues
 
 # SEE ALSO
 
