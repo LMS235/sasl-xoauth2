@@ -16,6 +16,10 @@ Postfix.
 
 ## Building from Source
 
+This section covers a new installation. To update an existing installation to
+a newer version, see [Updating an Existing
+Installation](#updating-an-existing-installation).
+
 ### Requirements
 
 | Purpose | Requirement | Ubuntu/Debian package |
@@ -110,12 +114,75 @@ Continue with [Configuration](#configuration).
 To build without the test program, add `-DEnableTests=OFF` to the first
 `cmake` command (and skip `ctest`).
 
-### Upgrading and Removing Older Installations
+### Updating an Existing Installation
 
-To upgrade, fetch the new sources and repeat the build and install steps above
-(`git pull`, then the `cmake` commands). `/etc/sasl-xoauth2.conf` and the token
-files are kept. Postfix picks up the new plugin when it restarts its `smtp`
-processes (`sudo postfix reload`).
+An update rebuilds the plugin from the newer sources and installs it over the
+existing installation. The configuration (`/etc/sasl-xoauth2.conf`), the token
+files, `/etc/postfix/sasl_passwd` and the systemd drop-in for Postfix are not
+touched.
+
+1. Change to the source directory from the original installation (if it no
+   longer exists, clone the repository again as in [Ubuntu 26.04
+   LTS](#ubuntu-2604-lts)). Note the installed version in case you need to go
+   back, and keep a copy of the configuration:
+
+   ```
+   $ cd sasl-xoauth2
+   $ git log -1 --oneline
+   $ sudo cp -a /etc/sasl-xoauth2.conf /etc/sasl-xoauth2.conf.bak
+   ```
+
+1. Fetch the new version, and read what changed (new entries at the top of
+   `ChangeLog`; check in particular whether any configuration changes are
+   needed):
+
+   ```
+   $ git pull
+   $ head -40 ChangeLog
+   ```
+
+1. Build, test and install exactly as for a new installation:
+
+   ```
+   $ cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/etc
+   $ cmake --build build -j"$(nproc)"
+   $ ctest --test-dir build
+   $ sudo cmake --install build
+   ```
+
+   The install reports `Keeping existing: /etc/sasl-xoauth2.conf`.
+
+1. Check that the new plugin loads, and that tokens can still be refreshed:
+
+   ```
+   $ saslpluginviewer -c -m XOAUTH2
+   $ sasl-xoauth2-tool test-config
+   $ sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
+   ```
+
+1. Let Postfix load the new plugin. Running `smtp` processes keep the old one
+   until they are replaced; `postfix reload` replaces them once they are done
+   with their current delivery:
+
+   ```
+   $ sudo postfix reload
+   ```
+
+1. Send a test mail and check the mail log (`journalctl -u postfix` or
+   `/var/log/mail.log`) for `status=sent`.
+
+To go back to the previous version, check out the version noted in step 1
+(`git checkout <commit>`), and repeat steps 3 to 5. Versions before the fix
+for [LMS235/sasl-xoauth2#3](https://github.com/LMS235/sasl-xoauth2/pull/3)
+overwrite `/etc/sasl-xoauth2.conf` when installing; restore it from the copy
+made in step 1. Afterwards, `git checkout master` returns to the current
+version.
+
+If the build fails after an update with errors about the CMake cache (for
+example after a major Ubuntu upgrade), remove the build directory (`rm -rf
+build`) and repeat step 3.
+
+### Removing Older Installations
 
 Before the first installation with the paths above, make sure no older copy of
 sasl-xoauth2 is installed elsewhere. In particular, an earlier build installed
