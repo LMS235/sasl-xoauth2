@@ -490,16 +490,22 @@ It may be necessary to adjust permissions on the resulting token file so that
 Postfix (or, more accurately, sasl-xoauth2 running as the Postfix user) can
 update it. See [A Note on Token File Permissions](#a-note-on-token-file-permissions).
 
-### Outlook/Office 365 Configuration (Client Credentials, App-Only)
+### Outlook/Office 365 Configuration (Client Credentials, App-Only) (Optional)
 
-For an unattended relay in a Microsoft 365 organization, the [client
-credentials grant
-flow](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth#use-client-credentials-grant-flow-to-authenticate-smtp-imap-and-pop-connections)
-is usually the most robust choice: no user ever signs in, and there is no
-refresh token that can expire after 90 days of inactivity, be revoked by a
-password change, or be blocked by a Conditional Access policy. sasl-xoauth2
-simply requests a new access token with the client ID and secret whenever the
-current one is about to expire.
+The delegated flows above (device flow or authorization code, with a refresh
+token) remain the default. Their interactive sign-in is a deliberate control:
+a refresh token that expires or is revoked (e.g. after 90 days of inactivity,
+a password change, or a Conditional Access policy) stops mail until someone
+signs in again. Monitor that with `sasl-xoauth2-tool test-token-refresh`
+(non-zero exit status on failure; it does not modify the token file).
+
+As an alternative, Microsoft 365 organizations can use the [client credentials
+grant
+flow](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth#use-client-credentials-grant-flow-to-authenticate-smtp-imap-and-pop-connections):
+no user signs in and there is no refresh token; sasl-xoauth2 requests a new
+access token with the client ID and secret whenever the current one is about
+to expire. Access is instead bounded by the client secret's lifetime and by the
+mailbox permissions granted in Exchange Online.
 
 #### Client Credentials
 
@@ -572,8 +578,8 @@ the token file.
   test-token-refresh` to see the reason from Microsoft Entra ID (an `AADSTS`
   code); sasl-xoauth2 also logs it, with a hint, when a token request fails.
 - A refresh token that has expired or been revoked (`invalid_grant`) can only
-  be replaced by running `sasl-xoauth2-tool get-token` again. The client
-  credentials flow above avoids refresh tokens altogether.
+  be replaced by running `sasl-xoauth2-tool get-token` again (optionally with
+  `--overwrite-existing-token` to keep other fields of the token file).
 - sasl-xoauth2 requests a new access token `refresh_window` seconds (default:
   300) before the current one expires; see the HVE note above.
 
