@@ -43,6 +43,10 @@ class TokenStore {
   // (e.g. a network problem or a provider outage).
   bool last_error_permanent() const { return last_error_permanent_; }
 
+  // Whether the last Refresh() obtained a token but could not store it in
+  // the token file (it is used anyway).
+  bool last_write_failed() const { return last_write_failed_; }
+
  private:
   TokenStore(Log *log, const std::string &path, bool enable_updates);
 
@@ -85,6 +89,7 @@ class TokenStore {
 
   int refresh_attempts_ = 0;
   bool last_error_permanent_ = false;
+  bool last_write_failed_ = false;
 };
 
 }  // namespace sasl_xoauth2

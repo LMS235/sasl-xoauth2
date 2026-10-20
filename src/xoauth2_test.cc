@@ -1437,6 +1437,58 @@ bool TestClientCredentialsWithCertificate() {
   return true;
 }
 
+// A scheduled refresh running as root must not take the token file (or its
+// lock file) away from the mail system's user.
+bool TestRootKeepsTokenFileOwner() {
+  PrintTestName(__func__);
+  if (geteuid() != 0) {
+    fprintf(stderr, "not running as root, skipping\n");
+    return true;
+  }
+  SetPasswordToTokenFile(TokenFileExpiringIn(3600));
+  const uid_t uid = 65534;  // nobody
+  const gid_t gid = 65534;
+  TEST_ASSERT(chown(s_password.c_str(), uid, gid) == 0);
+  FakeTokenEndpoint endpoint;
+  endpoint.response =
+      R"({"access_token": "new", "expires_in": 3599, "refresh_token": "r2"})";
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  // Refresh() always requests a new token, even if the current one is valid.
+  TEST_ASSERT_OK(store->Refresh());
+  TEST_ASSERT(!store->last_write_failed());
+  TEST_ASSERT(endpoint.calls == 1);
+
+  struct stat st = {};
+  TEST_ASSERT(stat(s_password.c_str(), &st) == 0);
+  TEST_ASSERT(st.st_uid == uid && st.st_gid == gid);
+  TEST_ASSERT((st.st_mode & 0777) == 0600);
+  TEST_ASSERT(stat((s_password + ".lock").c_str(), &st) == 0);
+  TEST_ASSERT(st.st_uid == uid && st.st_gid == gid);
+  TEST_ASSERT(ReadJsonFile(s_password)["refresh_token"].asString() == "r2");
+  return true;
+}
+
+bool TestWriteFailureReported() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT(unlink(s_password.c_str()) == 0);
+  TEST_ASSERT(mkdir(s_password.c_str(), 0700) == 0);
+  const int err = store->Refresh();
+  rmdir(s_password.c_str());
+  TEST_ASSERT_OK(err);
+  TEST_ASSERT(store->last_write_failed());
+  return true;
+}
+
 int main(int argc, char **argv) {
   sasl_xoauth2::EnableLoggingForTesting();
   TEST_ABORT(TestRedactSecret());
@@ -1501,6 +1553,8 @@ int main(int argc, char **argv) {
   TEST_ABORT(TestConfigSecretNotSentToOverriddenEndpoint());
   TEST_ABORT(TestTokenLifetimeHandling());
   TEST_ABORT(TestClientCredentialsWithCertificate());
+  TEST_ABORT(TestRootKeepsTokenFileOwner());
+  TEST_ABORT(TestWriteFailureReported());
 
   Cleanup();
   fprintf(stderr, "\nALL TESTS PASS.\n");

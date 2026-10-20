@@ -727,6 +727,38 @@ def subcommand_test_token_refresh(args:argparse.Namespace) -> None:
   sys.exit(run_test_tool(test_args))
 
 
+def subcommand_refresh_token(args:argparse.Namespace) -> None:
+  worst = 0
+  for token_file in args.token_files:
+    if len(args.token_files) > 1:
+      print(f"--- {token_file}", flush=True)
+    test_args = ['--token', token_file, '--update']
+    if args.config_file:
+      test_args.extend(['--config', args.config_file])
+    worst = max(worst, run_test_tool(test_args))
+  sys.exit(worst)
+
+
+sp_refresh_token = subparse.add_parser(
+    'refresh-token',
+    description='Requests a new token now and stores it in the token file, under the same lock '
+                'the plugin uses. Meant to run daily (e.g. from a systemd timer or cron): it keeps '
+                'refresh tokens that expire when unused (Microsoft: 90 days) alive even when no '
+                'mail is sent, and checks the setup like test-token-refresh. Exit status: 0 on '
+                'success, 1 on a transient failure, 2 on a failure that needs action (the highest '
+                'status if several files are given). Token files keep their owner, also when run '
+                'as root; preferably run it as the user the mail system runs as.')
+sp_refresh_token.set_defaults(func=subcommand_refresh_token)
+sp_refresh_token.add_argument(
+    '--config-file',
+    help="config file path (defaults to '%s')" % DEFAULT_CONFIG_FILE,
+)
+sp_refresh_token.add_argument(
+    'token_files', nargs='+', metavar='token_file',
+    help="token file(s) to refresh",
+)
+
+
 sp_test_token_refresh = subparse.add_parser(
     'test-token-refresh',
     description='Tests that a token can be refreshed (i.e., that the OAuth 2 flow is working correctly). '
