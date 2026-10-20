@@ -14,6 +14,10 @@
 
 #include <assert.h>
 #include <json/json.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
 #include <sasl/sasl.h>
 #include <sasl/saslplug.h>
 #include <stdio.h>
@@ -27,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "client_assertion.h"
 #include "config.h"
 #include "http.h"
 #include "log.h"
@@ -969,6 +974,11 @@ bool TestInvalidTokenFilesRejected() {
   SetPasswordToTokenFile(R"({"refresh_token": "r", "refresh_window": "-1"})");
   TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
 
+  // Far out of range (must not wrap around into the valid range).
+  SetPasswordToTokenFile(
+      R"({"refresh_token": "r", "refresh_window": "-4294967000"})");
+  TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
+
   // A window as long as the token lifetime would refresh on every connection.
   SetPasswordToTokenFile(R"({"refresh_token": "r", "refresh_window": "3600"})");
   TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
@@ -1073,6 +1083,360 @@ bool TestControlCharacterInUserRejected(sasl_client_plug_t plug) {
   return true;
 }
 
+// Captures what a Log would write, to check the summary logged on failure.
+class CapturingLogImpl : public sasl_xoauth2::LogImpl {
+ public:
+  explicit CapturingLogImpl(std::vector<std::string> *lines) : lines_(lines) {}
+  void WriteLine(const std::string &line) override { lines_->push_back(line); }
+
+ private:
+  std::vector<std::string> *lines_;
+};
+
+class CapturingLog : public sasl_xoauth2::Log {
+ public:
+  explicit CapturingLog(std::vector<std::string> *lines)
+      : Log(std::make_unique<CapturingLogImpl>(lines), OPTIONS_NONE,
+            /*discard=*/false) {}
+};
+
+std::string Join(const std::vector<std::string> &lines) {
+  std::string out;
+  for (const auto &line : lines) out += line + "\n";
+  return out;
+}
+
+bool TestParseInteger() {
+  PrintTestName(__func__);
+  long long v = 0;
+  TEST_ASSERT(sasl_xoauth2::ParseInteger("3599", &v) && v == 3599);
+  TEST_ASSERT(sasl_xoauth2::ParseInteger("-5", &v) && v == -5);
+  TEST_ASSERT(!sasl_xoauth2::ParseInteger("", &v));
+  TEST_ASSERT(!sasl_xoauth2::ParseInteger("-", &v));
+  TEST_ASSERT(!sasl_xoauth2::ParseInteger("3599abc", &v));
+  TEST_ASSERT(!sasl_xoauth2::ParseInteger(" 1", &v));
+  TEST_ASSERT(!sasl_xoauth2::ParseInteger("99999999999999999999", &v));
+  return true;
+}
+
+bool TestBase64UrlEncode() {
+  PrintTestName(__func__);
+  // RFC 4648 test vectors, in the URL-safe alphabet without padding.
+  TEST_ASSERT(sasl_xoauth2::Base64UrlEncode("") == "");
+  TEST_ASSERT(sasl_xoauth2::Base64UrlEncode("f") == "Zg");
+  TEST_ASSERT(sasl_xoauth2::Base64UrlEncode("fo") == "Zm8");
+  TEST_ASSERT(sasl_xoauth2::Base64UrlEncode("foo") == "Zm9v");
+  TEST_ASSERT(sasl_xoauth2::Base64UrlEncode("foobar") == "Zm9vYmFy");
+  TEST_ASSERT(sasl_xoauth2::Base64UrlEncode("\xfb\xff") == "-_8");
+  return true;
+}
+
+bool TestEscapeForLogTruncates() {
+  PrintTestName(__func__);
+  const std::string escaped =
+      sasl_xoauth2::EscapeForLog(std::string(100, 'a'), 10);
+  TEST_ASSERT(escaped == "aaaaaaaaaa...<100 bytes>");
+  return true;
+}
+
+// With the default settings only one line is logged when authentication
+// fails: it must carry the provider's reason, not merely the last step.
+bool TestFailureSummaryCarriesReason() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  FakeTokenEndpoint endpoint;
+  endpoint.response_code = 400;
+  endpoint.response =
+      R"({"error": "invalid_grant", "error_description": "AADSTS700082: The refresh token has expired due to inactivity.\r\nFake: line"})";
+  endpoint.Install();
+
+  std::vector<std::string> lines;
+  {
+    CapturingLog log(&lines);
+    auto store = sasl_xoauth2::TokenStore::Create(&log, s_password);
+    TEST_ASSERT(store != nullptr);
+    std::string token;
+    TEST_ASSERT(store->GetAccessToken(&token) != SASL_OK);
+    TEST_ASSERT(store->last_error_permanent());
+    log.SetFlushOnDestroy();
+  }
+  const std::string output = Join(lines);
+  fprintf(stderr, "logged:\n%s", output.c_str());
+  TEST_ASSERT(lines.size() == 2);
+  TEST_ASSERT(lines[0].find("auth failed (sasl-xoauth2 ") == 0);
+  TEST_ASSERT(lines[0].find(s_password) != std::string::npos);
+  TEST_ASSERT(lines[0].find("HTTP 400 invalid_grant: AADSTS700082") !=
+              std::string::npos);
+  TEST_ASSERT(lines[0].find("hint: the refresh token was rejected") !=
+              std::string::npos);
+  // Control characters from the response are escaped, not written.
+  TEST_ASSERT(lines[0].find("\\x0d\\x0aFake: line") != std::string::npos);
+  TEST_ASSERT(output.find('\r') == std::string::npos);
+  return true;
+}
+
+bool TestTransientErrorIsNotPermanent() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  FakeTokenEndpoint endpoint;
+  endpoint.response_code = 503;
+  endpoint.response = "<html>Service Unavailable</html>";
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT(store->GetAccessToken(&token) != SASL_OK);
+  TEST_ASSERT(!store->last_error_permanent());
+  return true;
+}
+
+// The provider cannot be reached shortly before the token expires: the token
+// is still good, so it is used rather than deferring mail.
+bool TestValidTokenUsedWhenRefreshFails() {
+  PrintTestName(__func__);
+  FakeTokenEndpoint endpoint;
+  endpoint.response_code = 503;
+  endpoint.response = "";
+  endpoint.Install();
+  auto log = sasl_xoauth2::Log::Create();
+  std::string token;
+
+  // 120s left, within the (default 300s) refresh window.
+  SetPasswordToTokenFile(TokenFileExpiringIn(120));
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  TEST_ASSERT(token == "access");
+  TEST_ASSERT(endpoint.calls == 1);
+
+  // Too close to expiry to be of use.
+  SetPasswordToTokenFile(TokenFileExpiringIn(30));
+  store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT(store->GetAccessToken(&token) != SASL_OK);
+  return true;
+}
+
+// Storing the new token fails (here: the token file became a directory, as
+// a stand-in for a read-only or full file system). The new token is still
+// used.
+bool TestNewTokenUsedWhenWriteFails() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT(unlink(s_password.c_str()) == 0);
+  TEST_ASSERT(mkdir(s_password.c_str(), 0700) == 0);
+
+  std::string token;
+  const int err = store->GetAccessToken(&token);
+  rmdir(s_password.c_str());
+  TEST_ASSERT_OK(err);
+  TEST_ASSERT(token == "refreshed_access");
+  TEST_ASSERT(endpoint.calls == 1);
+  return true;
+}
+
+// A token file that points requests elsewhere does not get the configured
+// client secret sent there.
+bool TestConfigSecretNotSentToOverriddenEndpoint() {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(
+      R"({"refresh_token": "r", "token_endpoint": "https://attacker.example/token"})");
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT(store->GetAccessToken(&token) != SASL_OK);
+  TEST_ASSERT(endpoint.calls == 0);
+  TEST_ASSERT(store->last_error_permanent());
+  return true;
+}
+
+bool TestTokenLifetimeHandling() {
+  PrintTestName(__func__);
+  auto log = sasl_xoauth2::Log::Create();
+  std::string token;
+
+  // An unreadable expiry only means "refresh now".
+  SetPasswordToTokenFile(
+      R"({"access_token": "a", "refresh_token": "r", "expiry": "soon"})");
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  TEST_ASSERT(endpoint.calls == 1);
+
+  // An absurd lifetime is limited instead of overflowing.
+  SetPasswordToExpiredToken();
+  endpoint.response =
+      R"({"access_token": "x", "expires_in": 9223372036854775000})";
+  store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  const long long expiry =
+      std::stoll(ReadJsonFile(s_password)["expiry"].asString());
+  TEST_ASSERT(expiry > time(nullptr) && expiry <= time(nullptr) + 7 * 86400);
+
+  // A lifetime that is not a number is rejected.
+  SetPasswordToExpiredToken();
+  endpoint.response = R"({"access_token": "x", "expires_in": "3599abc"})";
+  store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT(store->GetAccessToken(&token) != SASL_OK);
+  return true;
+}
+
+std::string Base64UrlDecode(std::string in) {
+  for (char &c : in) {
+    if (c == '-') c = '+';
+    if (c == '_') c = '/';
+  }
+  while (in.size() % 4) in += '=';
+  std::vector<unsigned char> out(in.size());
+  const int n = EVP_DecodeBlock(
+      out.data(), reinterpret_cast<const unsigned char *>(in.data()),
+      in.size());
+  if (n < 0) return {};
+  size_t len = n;
+  for (size_t i = in.size(); i > 0 && in[i - 1] == '='; --i) len--;
+  return std::string(reinterpret_cast<char *>(out.data()), len);
+}
+
+// Client credentials with a certificate: the request carries a client
+// assertion as Microsoft specifies it (PS256, x5t#S256, aud/iss/sub/jti/nbf/
+// iat/exp), and its signature verifies with the certificate's public key.
+bool TestClientCredentialsWithCertificate() {
+  PrintTestName(__func__);
+  const std::string dir = s_password + ".certdir";
+  const std::string cert = dir + "/cert.pem", key = dir + "/key.pem";
+  const std::string command =
+      "mkdir -p '" + dir +
+      "' && openssl req -x509 -newkey rsa:2048 -sha256 "
+      "-days 2 -nodes -subj /CN=sasl-xoauth2-test -keyout '" +
+      key + "' -out '" + cert + "' >/dev/null 2>&1";
+  if (system(command.c_str()) != 0) {
+    fprintf(stderr, "openssl not available, skipping\n");
+    return true;
+  }
+  s_cleanup_files.push_back(cert);
+  s_cleanup_files.push_back(key);
+
+  const std::string endpoint_url =
+      "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/"
+      "token";
+  SetPasswordToTokenFile(
+      R"({"grant_type": "client_credentials",
+          "scope": "https://outlook.office365.com/.default",
+          "client_id": "00001111-aaaa-2222-bbbb-3333cccc4444",
+          "token_endpoint": ")" +
+      endpoint_url + R"(",
+          "client_certificate_file": ")" +
+      cert + R"(",
+          "client_private_key_file": ")" +
+      key + R"("})");
+  FakeTokenEndpoint endpoint;
+  endpoint.response = R"({"access_token": "cert_access", "expires_in": 3599})";
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  const time_t before = time(nullptr);
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  TEST_ASSERT(token == "cert_access");
+
+  // Request: an assertion instead of a secret.
+  const std::string &request = endpoint.last_request;
+  fprintf(stderr, "request=[%s]\n", request.substr(0, 200).c_str());
+  TEST_ASSERT(request.find("client_secret") == std::string::npos);
+  TEST_ASSERT(request.find("&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%"
+                           "3Aclient-assertion-type%3Ajwt-bearer") !=
+              std::string::npos);
+  const std::string marker = "&client_assertion=";
+  const size_t start = request.find(marker);
+  TEST_ASSERT(start != std::string::npos);
+  const size_t end = request.find('&', start + marker.size());
+  const std::string jwt =
+      request.substr(start + marker.size(), end - start - marker.size());
+  const size_t dot1 = jwt.find('.'), dot2 = jwt.rfind('.');
+  TEST_ASSERT(dot1 != std::string::npos && dot2 > dot1);
+
+  Json::Value header, claims;
+  std::stringstream(Base64UrlDecode(jwt.substr(0, dot1))) >> header;
+  std::stringstream(Base64UrlDecode(jwt.substr(dot1 + 1, dot2 - dot1 - 1))) >>
+      claims;
+  TEST_ASSERT(header["alg"].asString() == "PS256");
+  TEST_ASSERT(header["typ"].asString() == "JWT");
+  TEST_ASSERT(claims["aud"].asString() == endpoint_url);
+  TEST_ASSERT(claims["iss"].asString() ==
+              "00001111-aaaa-2222-bbbb-3333cccc4444");
+  TEST_ASSERT(claims["sub"].asString() == claims["iss"].asString());
+  TEST_ASSERT(claims["jti"].asString().size() == 36);
+  TEST_ASSERT(claims["nbf"].asInt64() >= before &&
+              claims["nbf"].asInt64() <= time(nullptr));
+  TEST_ASSERT(claims["iat"].asInt64() == claims["nbf"].asInt64());
+  TEST_ASSERT(claims["exp"].asInt64() - claims["nbf"].asInt64() == 300);
+
+  // Thumbprint and signature, checked independently with OpenSSL.
+  FILE *f = fopen(cert.c_str(), "r");
+  TEST_ASSERT(f != nullptr);
+  X509 *x509 = PEM_read_X509(f, nullptr, nullptr, nullptr);
+  fclose(f);
+  TEST_ASSERT(x509 != nullptr);
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int digest_len = 0;
+  TEST_ASSERT(X509_digest(x509, EVP_sha256(), digest, &digest_len) == 1);
+  TEST_ASSERT(header["x5t#S256"].asString() ==
+              sasl_xoauth2::Base64UrlEncode(
+                  std::string(reinterpret_cast<char *>(digest), digest_len)));
+
+  EVP_PKEY *public_key = X509_get_pubkey(x509);
+  const std::string signing_input = jwt.substr(0, dot2);
+  const std::string signature = Base64UrlDecode(jwt.substr(dot2 + 1));
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  EVP_PKEY_CTX *pctx = nullptr;
+  bool verified =
+      EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), nullptr, public_key) ==
+          1 &&
+      EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) == 1 &&
+      EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) == 1 &&
+      EVP_DigestVerify(
+          ctx, reinterpret_cast<const unsigned char *>(signature.data()),
+          signature.size(),
+          reinterpret_cast<const unsigned char *>(signing_input.data()),
+          signing_input.size()) == 1;
+  EVP_MD_CTX_free(ctx);
+  EVP_PKEY_free(public_key);
+  X509_free(x509);
+  TEST_ASSERT(verified);
+
+  // A key that does not belong to the certificate is reported, not sent.
+  const std::string other_key = dir + "/other.pem";
+  s_cleanup_files.push_back(other_key);
+  TEST_ASSERT(system(("openssl genpkey -algorithm RSA -out '" + other_key +
+                      "' >/dev/null 2>&1")
+                         .c_str()) == 0);
+  std::string assertion, error;
+  TEST_ASSERT(!sasl_xoauth2::CreateClientAssertion(
+      cert, other_key, "id", endpoint_url, time(nullptr), &assertion, &error));
+  fprintf(stderr, "expected error: %s\n", error.c_str());
+  TEST_ASSERT(error.find("does not belong") != std::string::npos);
+  rmdir(dir.c_str());
+  return true;
+}
+
 int main(int argc, char **argv) {
   sasl_xoauth2::EnableLoggingForTesting();
   TEST_ABORT(TestRedactSecret());
@@ -1127,6 +1491,16 @@ int main(int argc, char **argv) {
   TEST_ABORT(TestMaxRefreshAttempts());
   TEST_ABORT(TestErrorResponse());
   TEST_ABORT(TestControlCharacterInUserRejected(plug));
+  TEST_ABORT(TestParseInteger());
+  TEST_ABORT(TestBase64UrlEncode());
+  TEST_ABORT(TestEscapeForLogTruncates());
+  TEST_ABORT(TestFailureSummaryCarriesReason());
+  TEST_ABORT(TestTransientErrorIsNotPermanent());
+  TEST_ABORT(TestValidTokenUsedWhenRefreshFails());
+  TEST_ABORT(TestNewTokenUsedWhenWriteFails());
+  TEST_ABORT(TestConfigSecretNotSentToOverriddenEndpoint());
+  TEST_ABORT(TestTokenLifetimeHandling());
+  TEST_ABORT(TestClientCredentialsWithCertificate());
 
   Cleanup();
   fprintf(stderr, "\nALL TESTS PASS.\n");

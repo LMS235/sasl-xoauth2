@@ -15,9 +15,11 @@
 #include "config.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <sasl/sasl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
 
@@ -82,12 +84,12 @@ int Transform(std::string in, std::string *out) {
 
 template <>
 int Transform(std::string in, int *out) {
-  size_t parsed = 0;
-  *out = stoi(in, &parsed);
-  if (parsed != in.size()) {
+  long long value = 0;
+  if (!ParseInteger(in, &value) || value < INT_MIN || value > INT_MAX) {
     Log("sasl-xoauth2: Invalid integer value '%s'.\n", in.c_str());
     return SASL_FAIL;
   }
+  *out = static_cast<int>(value);
   return SASL_OK;
 }
 
@@ -103,6 +105,21 @@ int Fetch(const Json::Value &root, const std::string &name, bool optional,
 }
 
 }  // namespace
+
+bool ParseInteger(const std::string &in, long long *out) {
+  if (in.empty()) return false;
+  size_t i = (in[0] == '-') ? 1 : 0;
+  if (i == in.size()) return false;
+  for (; i < in.size(); ++i) {
+    if (in[i] < '0' || in[i] > '9') return false;
+  }
+  errno = 0;
+  char *end = nullptr;
+  const long long value = strtoll(in.c_str(), &end, 10);
+  if (errno == ERANGE || *end != '\0') return false;
+  *out = value;
+  return true;
+}
 
 void Config::EnableLoggingToStderr() { s_log_to_stderr = true; }
 
@@ -175,7 +192,8 @@ int Config::Init(const Json::Value &root) {
     err = Fetch(root, "client_id", false, &client_id_);
     if (err != SASL_OK) return err;
 
-    err = Fetch(root, "client_secret", false, &client_secret_);
+    // Optional: public clients have none, and certificates replace it.
+    err = Fetch(root, "client_secret", true, &client_secret_);
     if (err != SASL_OK) return err;
 
     err = Fetch(root, "always_log_to_syslog", true,
@@ -220,6 +238,14 @@ int Config::Init(const Json::Value &root) {
     }
 
     err = Fetch(root, "scope", true, &scope_);
+    if (err != SASL_OK) return err;
+
+    err =
+        Fetch(root, "client_certificate_file", true, &client_certificate_file_);
+    if (err != SASL_OK) return err;
+
+    err =
+        Fetch(root, "client_private_key_file", true, &client_private_key_file_);
     if (err != SASL_OK) return err;
     if (grant_type_ == kGrantTypeClientCredentials && scope_.empty()) {
       // Not fatal: the scope may instead be set in each token file.

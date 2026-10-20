@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.0.0...3.31.6)
+cmake_minimum_required(VERSION 3.13...3.31.6)
 
 execute_process(
   COMMAND head -n 1 ChangeLog
@@ -25,6 +25,12 @@ project(sasl-xoauth2 VERSION ${CHANGELOG_VERSION} LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
+# Default to an optimized build with debug info (also needed for
+# _FORTIFY_SOURCE); pass -DCMAKE_BUILD_TYPE=Debug for an unoptimized one.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type." FORCE)
+endif()
+
 option(EnableTests "Enable tests." ON)
 
 if(EnableTests)
@@ -36,6 +42,6 @@ add_subdirectory(src)
 
 set(CPACK_SOURCE_PACKAGE_FILE_NAME "${CMAKE_PROJECT_NAME}-${PROJECT_VERSION}")
 set(CPACK_SOURCE_GENERATOR "TGZ")
-set(CPACK_SOURCE_IGNORE_FILES "/build/;/packaging/;/packaging-build/;/packaging-output/;/packaging-scripts/;/.git/;/.gitignore;.clang-format;~$;${CPACK_SOURCE_IGNORE_FILES}")
+set(CPACK_SOURCE_IGNORE_FILES "/build/;/packaging/;/packaging-build/;/packaging-output/;/packaging-scripts/;/.git/;/.gitignore;.clang-format;~$;__pycache__/;\\.pyc$;${CPACK_SOURCE_IGNORE_FILES}")
 
 include(CPack)

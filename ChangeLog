@@ -33,6 +33,30 @@ sasl-xoauth2 (0.29) unstable; urgency=medium
   * Installing no longer overwrites an existing /etc/sasl-xoauth2.conf.
   * README: build instructions for Ubuntu 26.04 LTS; both Microsoft 365
     ways (delegated, app-only) described side by side.
+  * Client credentials can authenticate with a certificate (client
+    assertion, PS256, as specified by Microsoft) instead of a client secret:
+    client_certificate_file/client_private_key_file; tool: --certificate,
+    --private-key. client_secret is optional in the configuration file.
+  * The one-line failure log now names the token file, endpoint, HTTP status,
+    provider error and hint, and the plugin version.
+  * A new token that cannot be stored is used anyway (and an error logged);
+    a still-valid token is used if refreshing fails shortly before expiry.
+  * The configured client_secret is not sent to a token endpoint, proxy or CA
+    configured in a token file; such a file needs its own secret.
+  * Escape and cut provider responses in logs; limit token lifetimes; parse
+    numbers strictly; tolerate an unreadable expiry; setgid directories keep
+    the token file's group.
+  * Build: optimized and hardened by default (RelWithDebInfo,
+    _FORTIFY_SOURCE=3, stack protector, full RELRO), plugin exports only
+    sasl_client_plug_init, configuration installed with mode 0640; requires
+    OpenSSL and CMake 3.13.
+  * test-config/tool: --version; exit status 1 (transient) or 2 (needs
+    action); checks that the token directory is writable; ignores proxy
+    environment variables like Postfix; the tool locks token files while
+    updating them, refuses symlinks, requires https for --login-base, and
+    the Gmail flow no longer serves its authorization URL on localhost.
+  * README: verified TLS (smtp_tls_security_level = secure), production
+    checklist, Postfix settings, monitoring, shared mailboxes.
 
  -- Florian Lamml <florian.lamml@contis.de>  Tue, 20 Oct 2026 15:00:00 +0200
 

@@ -31,6 +31,10 @@ constexpr char kGrantTypeClientCredentials[] = "client_credentials";
 // close to that would request a new token for every connection.
 constexpr int kMaxRefreshWindow = 1800;  // seconds
 
+// Parses a decimal integer, accepting nothing else (no trailing characters,
+// no overflow). Returns false if |in| is not such a number.
+bool ParseInteger(const std::string &in, long long *out);
+
 class Config {
  public:
   static void EnableLoggingToStderr();
@@ -52,6 +56,12 @@ class Config {
   int refresh_window() const { return refresh_window_; }
   const std::string &grant_type() const { return grant_type_; }
   const std::string &scope() const { return scope_; }
+  const std::string &client_certificate_file() const {
+    return client_certificate_file_;
+  }
+  const std::string &client_private_key_file() const {
+    return client_private_key_file_;
+  }
 
   static bool IsValidGrantType(const std::string &grant_type);
   static bool IsValidRefreshWindow(int refresh_window);
@@ -76,6 +86,10 @@ class Config {
   int refresh_window_ = 300;  // seconds
   std::string grant_type_ = kGrantTypeRefreshToken;
   std::string scope_ = "";
+  // Authenticate with a certificate (client assertion) instead of
+  // client_secret. The key file defaults to the certificate file.
+  std::string client_certificate_file_ = "";
+  std::string client_private_key_file_ = "";
 };
 
 }  // namespace sasl_xoauth2

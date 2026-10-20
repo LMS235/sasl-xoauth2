@@ -269,13 +269,18 @@ int Client::TokenSentStep(sasl_client_params_t *params,
     stream >> root;
     if (root.isMember("status")) status = root["status"].asString();
   } catch (const std::exception &e) {
-    log_->Write("Client::TokenSentStep: caught exception: %s", e.what());
+    log_->Error("server sent an unreadable XOAUTH2 error response: %s",
+                EscapeForLog(e.what()).c_str());
     return SASL_BADPROT;
   }
 
   if (status == "400" || status == "401") {
     int err = token_->Refresh();
     if (err != SASL_OK) return err;
+    log_->Error(
+        "server rejected the token for %s (status %s); obtained a new token "
+        "for the next attempt",
+        EscapeForLog(user_).c_str(), EscapeForLog(status, 16).c_str());
     return SASL_TRYAGAIN;
   }
 
@@ -284,8 +289,8 @@ int Client::TokenSentStep(sasl_client_params_t *params,
     return SASL_OK;
   }
 
-  log_->Write("Client::TokenSentStep: status: %s",
-              EscapeForLog(status).c_str());
+  log_->Error("server rejected authentication for %s with status %s",
+              EscapeForLog(user_).c_str(), EscapeForLog(status, 64).c_str());
   return SASL_BADPROT;
 }
 
@@ -297,11 +302,13 @@ int Client::SendToken(const char **to_server, unsigned int *to_server_len) {
   // \1 separates the fields of the XOAUTH2 initial response, so neither value
   // may contain it (nor any other control character).
   if (!IsValidResponseField(user_)) {
-    log_->Write("Client::SendToken: invalid user name");
+    log_->Error("invalid user name %s (contains control characters)",
+                EscapeForLog(user_).c_str());
     return SASL_BADPARAM;
   }
   if (token.empty() || !IsValidResponseField(token)) {
-    log_->Write("Client::SendToken: invalid access token");
+    log_->Error("invalid access token for %s (empty or control characters)",
+                EscapeForLog(user_).c_str());
     return SASL_BADPROT;
   }
 

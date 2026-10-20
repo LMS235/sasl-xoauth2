@@ -26,6 +26,7 @@ Installation](#updating-an-existing-installation).
 |---|---|---|
 | Compiler and build tools | C++17 compiler, `make`, CMake, pkg-config | `build-essential`, `cmake`, `pkgconf` |
 | HTTPS requests | libcurl (OpenSSL or GnuTLS flavor) | `libcurl4-openssl-dev` |
+| Client certificates (signing client assertions) | OpenSSL (libcrypto) | `libssl-dev` |
 | JSON | jsoncpp | `libjsoncpp-dev` |
 | SASL plugin API | Cyrus SASL headers | `libsasl2-dev` |
 | Man page `sasl-xoauth2.conf(5)` | pandoc (**required**; configuration fails without it) | `pandoc` |
@@ -38,12 +39,12 @@ Installation](#updating-an-existing-installation).
 ### Ubuntu 26.04 LTS
 
 This was tested on Ubuntu 26.04.1 LTS (GCC 15.2, CMake 4.2, libcurl 8.18,
-jsoncpp 1.9.6, Cyrus SASL 2.1.28, Python 3.14). Install the build
-dependencies:
+OpenSSL 3, jsoncpp 1.9.6, Cyrus SASL 2.1.28, Postfix 3.10, Python 3.14).
+Install the build dependencies:
 
 ```
 $ sudo apt install build-essential cmake pkgconf git \
-    libcurl4-openssl-dev libjsoncpp-dev libsasl2-dev \
+    libcurl4-openssl-dev libssl-dev libjsoncpp-dev libsasl2-dev \
     pandoc python3-argparse-manpage
 ```
 
@@ -67,7 +68,9 @@ $ ctest --test-dir build
 $ sudo cmake --install build
 ```
 
-The two `-D` options matter: with CMake's default prefix (`/usr/local`) the
+The build is optimized and hardened by default (`RelWithDebInfo`, with
+`_FORTIFY_SOURCE`, stack protector and full RELRO), and the plugin exports
+only its SASL entry point. The two `-D` options matter: with CMake's default prefix (`/usr/local`) the
 plugin would be installed to `/usr/local/lib/sasl2`, where the system's Cyrus
 SASL library (and thus Postfix) does not look, and the configuration file to
 `/usr/local/etc`. With the options above, the following files are installed:
@@ -75,7 +78,7 @@ SASL library (and thus Postfix) does not look, and the configuration file to
 | File | Purpose |
 |---|---|
 | `/usr/lib/x86_64-linux-gnu/sasl2/libsasl-xoauth2.so` | The SASL plugin |
-| `/etc/sasl-xoauth2.conf` | Configuration file template (see [Configuration](#configuration)); only installed if the file does not exist yet, an existing configuration is never overwritten |
+| `/etc/sasl-xoauth2.conf` | Configuration file template (see [Configuration](#configuration)), mode `0640`; only installed if the file does not exist yet, an existing configuration is never overwritten |
 | `/usr/bin/sasl-xoauth2-tool` | Tool to obtain tokens and test the configuration |
 | `/usr/lib/x86_64-linux-gnu/sasl-xoauth2/test-config` | Helper used by `sasl-xoauth2-tool test-config` and `test-token-refresh` |
 | `/usr/share/man/man5/sasl-xoauth2.conf.5`, `/usr/share/man/man1/sasl-xoauth2-tool.1` | Man pages |
@@ -264,12 +267,23 @@ And then add:
 
 ```
 [Service]
-ReadWritePaths=/etc/tokens
+ReadWritePaths=-/etc/tokens
 ```
 
-Then `sudo systemctl restart postfix`. (For instances started via
-`postfix@.service`, edit that unit instead.) Token files inside the chroot
+Then `sudo systemctl restart postfix`. (The `-` keeps Postfix starting even if
+the directory does not exist. On Ubuntu 26.04, `postfix.service` itself runs
+the Postfix master; for additional instances started via `postfix@.service`,
+edit that unit instead.) Token files inside the chroot
 (`/var/spool/postfix/etc/tokens`) are not affected.
+
+To check that Postfix can write to the token directory from inside its
+sandbox, run the check in the mount namespace of the running Postfix master:
+
+```
+$ pid=$(sudo cat /var/spool/postfix/pid/master.pid | tr -d ' ')
+$ sudo nsenter --target "$pid" --mount -- runuser -u postfix -- test -w /etc/tokens && echo writable
+writable
+```
 
 ## Configuration
 
@@ -281,7 +295,8 @@ SASL, and specifically the XOAUTH2 method. In `/etc/postfix/main.cf`:
 ```
 smtp_sasl_auth_enable = yes
 smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
-smtp_sasl_security_options =
+smtp_sasl_security_options = noanonymous
+smtp_sasl_tls_security_options = noanonymous
 smtp_sasl_mechanism_filter = xoauth2
 ```
 
@@ -313,12 +328,41 @@ Plugin "login" [loaded],        API version: 4
 
 See https://www.cyrusimap.org/sasl/sasl/authentication_mechanisms.html#authentication-mechanisms for details on the fields.
 
-While you're at it, enable TLS:
+Then require TLS **with certificate verification**:
 
 ```
-smtp_tls_security_level = encrypt
+smtp_tls_security_level = secure
+smtp_tls_secure_cert_match = nexthop
 smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
 smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+```
+
+This is essential. XOAUTH2 sends the access token as a bearer credential:
+whoever obtains it can use it (for Gmail's `https://mail.google.com/` scope,
+even to read the mailbox) until it expires. TLS is the only protection, and
+the levels `may` and `encrypt` do not verify the server's certificate, so an
+attacker on the network path could impersonate the mail server with any
+certificate and collect the token. (For compatibility with existing
+configurations, the plugin declares itself as not sending plaintext
+passwords, so Postfix's `noplaintext` option does not stop XOAUTH2 without
+TLS; `secure` does.)
+
+If the host also delivers mail directly to other servers and should keep
+opportunistic TLS (`may`) for them, require verified TLS for the relay only:
+
+```
+smtp_tls_security_level = may
+smtp_tls_policy_maps = inline:{ { [smtp.office365.com]:587 = secure match=nexthop } }
+smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
+```
+
+Check the relay's certificate with `posttls-finger`, which ships with
+Postfix:
+
+```
+$ posttls-finger -c -l secure -P /etc/ssl/certs "[smtp.office365.com]:587"
+...
+posttls-finger: Verified TLS connection established to smtp.office365.com[...]:587: TLSv1.3 ...
 ```
 
 And then set the outbound relay to Gmail's SMTP server:
@@ -381,17 +425,28 @@ it serializes token refreshes between Postfix processes with a lock file
 Postfix user:
 
 ```
+$ sudo mkdir -p /etc/tokens
 $ sudo chown -R postfix:postfix /etc/tokens
 $ sudo chmod 700 /etc/tokens
-$ sudo chmod 600 /etc/tokens/*
+$ sudo find /etc/tokens -type f -exec chmod 600 {} +
 ```
 
-or, with chroot:
+or, with chroot, the same for `/var/spool/postfix/etc/tokens`. (`find` rather
+than `chmod 600 /etc/tokens/*`: once the directory belongs to `postfix`, the
+`*` cannot be expanded by an unprivileged shell.)
+
+The easiest way to get ownership right is to run `sasl-xoauth2-tool` as the
+Postfix user, e.g. `sudo -u postfix sasl-xoauth2-tool get-token ...`; the
+token file then belongs to `postfix` from the start.
+
+The configuration file `/etc/sasl-xoauth2.conf` may contain a client secret as
+well. Postfix reads it while still running as root, so it does not have to be
+readable for others; make it readable for the `postfix` group, so that
+`sasl-xoauth2-tool test-token-refresh` can run as the Postfix user:
 
 ```
-$ sudo chown -R postfix:postfix /var/spool/postfix/etc/tokens
-$ sudo chmod 700 /var/spool/postfix/etc/tokens
-$ sudo chmod 600 /var/spool/postfix/etc/tokens/*
+$ sudo chown root:postfix /etc/sasl-xoauth2.conf
+$ sudo chmod 640 /etc/sasl-xoauth2.conf
 ```
 
 Updated token files keep the owner and group permission bits of the file they
@@ -400,8 +455,11 @@ replace; permissions for other users are never carried over. (Versions before
 made them world-readable. Re-run the `chmod` above after upgrading.)
 `sasl-xoauth2-tool` creates new token files readable by their owner only; when
 it updates an existing file (`--overwrite-existing-token`), it keeps the file's
-owner and group, so running it as root does not lock Postfix out. A new file
-created as root still needs the `chown` above.
+owner and group, so running it as root does not lock Postfix out, and it takes
+the same lock as the plugin, so that the two cannot overwrite each other's
+changes. A new file created as root still needs the `chown` above. Do not edit
+token files by hand while Postfix is delivering mail through them; if you must
+(e.g. to replace a client secret), stop Postfix first or use the tool.
 
 #### SSL/TLS Certificates
 
@@ -485,20 +543,21 @@ We'll also need these credentials in the next step.
 the generation of Gmail OAuth tokens. Run the script as follows:
 
 ```shell
-$ sasl-xoauth2-tool get-token gmail \
+$ sudo -u postfix sasl-xoauth2-tool get-token gmail \
     PATH_TO_TOKENS_FILE \
     --client-id=CLIENT_ID_FROM_SASL_XOAUTH2_CONF \
-    --client-secret=CLIENT_SECRET_FROM_SASL_XOAUTH2_CONF \
     --scope="https://mail.google.com/"
+Please enter OAuth2 client secret:
+Please open this URL in a browser ON THIS HOST (or one that has port 54332 forwarded to this host):
 
-Please open this URL in a browser ON THIS HOST (or that has port 54332 forwarded to this host):
-
-http://127.0.0.1:54332/auth
+https://accounts.google.com/o/oauth2/auth?client_id=...&state=...&code_challenge=...
 ```
 
-The tool listens on `127.0.0.1` only (use `--local-listen-address` to change
-this, e.g. inside a container), and protects the exchange with a random `state`
-and PKCE.
+The tool asks for the client secret rather than taking it on the command line
+(where it would end up in the shell history and be visible to other users in
+`ps`). It listens on `127.0.0.1` only (use `--local-listen-address` to change
+this, e.g. inside a container), accepts only the answer to its own request
+(random `state` and PKCE), and serves nothing but that answer.
 
 (This script must run on the same host that is opening the URL -- it's not
 possible to copy the URL and paste it into a browser on another computer. This
@@ -543,17 +602,17 @@ access and in what the token file contains.
 |  | [Way A: delegated access (interactive sign-in)](#way-a-delegated-access-with-sasl-xoauth2-tool-get-token) | [Way B: app-only access (client credentials)](#way-b-app-only-access-with-client-credentials) |
 |---|---|---|
 | Who authorizes | The mailbox user signs in once with `sasl-xoauth2-tool get-token` | An administrator grants an application access to the mailbox; nobody signs in |
-| Token file holds | A refresh token | Client ID and client secret |
-| Access ends when | The refresh token expires or is revoked (e.g. 90 days without use, password change, Conditional Access); the user must sign in again | The client secret expires (at most 24 months) or is deleted, or the mailbox permission is removed |
-| Entra ID application | Public client, delegated permission `SMTP.Send` | Confidential client with a secret, application permission `SMTP.SendAsApp` with admin consent, service principal registered in Exchange Online |
+| Token file holds | A refresh token | Client ID and a certificate (recommended) or a client secret |
+| Access ends when | The refresh token expires or is revoked (e.g. 90 days without use, password change, Conditional Access); the user must sign in again | The certificate or client secret expires (a secret after at most 24 months) or is removed, or the mailbox permission is removed |
+| Entra ID application | Public client, delegated permission `SMTP.Send` | Confidential client with a certificate or secret, application permission `SMTP.SendAsApp` with admin consent, service principal registered in Exchange Online |
 | Accounts | Personal (outlook.com) and work/school accounts | Work/school (Microsoft 365) accounts only |
 | Selected by | Default (`grant_type` `refresh_token`) | `"grant_type": "client_credentials"` in the token file |
 
 Way A is the default. Its interactive sign-in is a deliberate control: when the
 refresh token stops working, a person has to confirm access again. Way B suits
 unattended relays where that is not wanted; access is then bounded by the
-lifetime of the client secret and by the mailbox permissions in Exchange
-Online. Both can coexist on one host, each with its own token file.
+lifetime of the certificate or client secret and by the mailbox permissions in
+Exchange Online. Both can coexist on one host, each with its own token file.
 
 #### Common Prerequisites
 
@@ -686,7 +745,7 @@ is the path from `sasl_passwd` -- with chroot, below `/var/spool/postfix` (see
 [A Note on chroot](#a-note-on-chroot)):
 
 ```shell
-$ sasl-xoauth2-tool get-token outlook \
+$ sudo -u postfix sasl-xoauth2-tool get-token outlook \
     /etc/tokens/relay@contoso.com \
     --client-id=APPLICATION_ID \
     --tenant=TENANT_ID \
@@ -696,24 +755,23 @@ Acquired token.
 Wrote token to /etc/tokens/relay@contoso.com.
 ```
 
+(`sudo -u postfix` creates the file as the Postfix user, in the directory
+prepared as in [A Note on Token File
+Permissions](#a-note-on-token-file-permissions).)
+
 Open the page in any browser (it does not have to be on this host), enter the
 code, sign in as the mailbox user and accept the prompts. Omit `--tenant` for
 personal accounts (it defaults to `consumers`), and add `--cloud` for national
 clouds. The device flow needs the Python `msal` module.
 
-Then give the token file to the Postfix user (see [A Note on Token File
-Permissions](#a-note-on-token-file-permissions)):
-
-```
-$ sudo chown -R postfix:postfix /etc/tokens
-$ sudo chmod 700 /etc/tokens
-$ sudo chmod 600 /etc/tokens/*
-```
+If you ran the tool as another user (e.g. root), give the token file to the
+Postfix user afterwards (see [A Note on Token File
+Permissions](#a-note-on-token-file-permissions)).
 
 ##### A4. Test
 
 ```
-$ sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
+$ sudo -u postfix sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
 Config check passed.
 Token refresh succeeded.
 ```
@@ -731,7 +789,7 @@ command, adding `--overwrite-existing-token` to keep any other fields of the
 token file (such as `user` or `token_endpoint`):
 
 ```shell
-$ sasl-xoauth2-tool get-token outlook \
+$ sudo -u postfix sasl-xoauth2-tool get-token outlook \
     /etc/tokens/relay@contoso.com \
     --client-id=APPLICATION_ID \
     --tenant=TENANT_ID \
@@ -744,10 +802,11 @@ restart: the token file is read for every authentication.
 
 ##### A6. Monitoring
 
-Run `sasl-xoauth2-tool test-token-refresh TOKEN_FILE` regularly (for example
-from cron or your monitoring system). It exits with a non-zero status, and
-prints the reason, when the refresh token no longer works. It does not modify
-the token file.
+Run `sudo -u postfix sasl-xoauth2-tool test-token-refresh TOKEN_FILE` regularly
+(for example daily from cron or your monitoring system); see [Monitoring](#monitoring).
+It prints the reason and exits with status 2 when the refresh token no longer
+works (`invalid_grant`), 1 for transient problems. It does not modify the
+token file.
 
 Note that only Postfix's own token refreshes (which happen when mail is sent)
 extend the life of the stored refresh token; the monitoring check does not. A
@@ -794,21 +853,52 @@ An application gets permission to send as an existing mailbox, using the
 [client credentials grant
 flow](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth#use-client-credentials-grant-flow-to-authenticate-smtp-imap-and-pop-connections).
 Nobody signs in and there is no refresh token: whenever the current access
-token is about to expire, sasl-xoauth2 requests a new one with the client ID and
-secret. The mailbox itself is unchanged. All steps are done by administrators.
+token is about to expire, sasl-xoauth2 requests a new one for the
+application. The mailbox itself is unchanged. All steps are done by
+administrators.
+
+The application authenticates with either of:
+
+- **A certificate (recommended).** sasl-xoauth2 signs a short-lived client
+  assertion with the certificate's private key for every token request
+  ([certificate
+  credentials](https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials)).
+  The private key never leaves the host; only the certificate (public key) is
+  uploaded to Entra ID. Each assertion is bound to the token endpoint and
+  valid for 5 minutes, so an intercepted one is of no use elsewhere, and the
+  certificate's validity can be chosen freely. Microsoft recommends
+  certificates over secrets for this flow.
+- **A client secret.** Simpler to set up, but the secret itself is sent with
+  every token request, and Entra ID secrets expire after at most 24 months.
 
 ##### B1. Register the Application
 
-Use a separate application from Way A (that one is a public client without a
-secret). In the Microsoft Entra admin center:
+Use a separate application from Way A (that one is a public client without
+credentials). In the Microsoft Entra admin center:
 
 1. [Register an
    application](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)
    for "Accounts in this organizational directory only". No redirect URI or
    platform configuration is needed, and "Allow public client flows" stays
    "no".
-1. Under "Certificates & secrets", create a new client secret. Copy its
-   *value* (it is shown only once) and note its expiry date.
+1. Add a credential under "Certificates & secrets":
+   - **Certificate (recommended):** create a key pair and a self-signed
+     certificate on the Postfix host, as the Postfix user, so that the
+     private key is readable only by it:
+
+     ```
+     $ sudo -u postfix openssl req -x509 -newkey rsa:3072 -sha256 -days 730 -nodes \
+         -subj "/CN=sasl-xoauth2 relay@contoso.com" \
+         -keyout /etc/tokens/relay-app.key -out /etc/tokens/relay-app.crt
+     $ sudo chmod 600 /etc/tokens/relay-app.key
+     ```
+
+     Upload `relay-app.crt` (never the `.key`) under "Certificates" → "Upload
+     certificate", and note its expiry date. Only RSA keys are supported
+     (the assertion is signed with PS256), and the key file must not be
+     protected with a passphrase, as Postfix needs to use it unattended.
+   - **Client secret:** create a new client secret under "Client secrets".
+     Copy its *value* (it is shown only once) and note its expiry date.
 1. Under "API permissions", choose "Add a permission", then "APIs my
    organization uses", search for "Office 365 Exchange Online", choose
    "Application permissions", and select `SMTP.SendAsApp`.
@@ -844,11 +934,31 @@ Permission changes in Exchange Online can take a while to take effect.
 
 ##### B3. Create the Token File
 
-`sasl-xoauth2-tool` creates the token file and, in doing so, checks that a
-token can actually be obtained:
+With a **certificate**:
 
 ```shell
-$ sasl-xoauth2-tool get-token outlook \
+$ sudo -u postfix sasl-xoauth2-tool get-token outlook \
+    /etc/tokens/relay@contoso.com \
+    --client-credentials \
+    --tenant=TENANT_ID \
+    --client-id=APPLICATION_ID \
+    --certificate=/etc/tokens/relay-app.crt \
+    --private-key=/etc/tokens/relay-app.key \
+    --mailbox=relay@contoso.com
+Wrote token to /etc/tokens/relay@contoso.com.
+Requesting a token with the certificate to check the setup:
+Config check passed.
+Token refresh succeeded.
+```
+
+The tool writes the token file and then requests a token through the plugin's
+own code, so a success here means the setup works. (`--private-key` can be left
+out if the key is in the certificate file.)
+
+With a **client secret**:
+
+```shell
+$ sudo -u postfix sasl-xoauth2-tool get-token outlook \
     /etc/tokens/relay@contoso.com \
     --client-credentials \
     --tenant=TENANT_ID \
@@ -859,10 +969,11 @@ Acquired app-only token.
 Wrote token to /etc/tokens/relay@contoso.com.
 ```
 
-(Add `--cloud` for national clouds. The secret can also be passed with
-`--client-secret`, but then it ends up in the shell history.) The file contains
-everything needed to request new tokens, and is created readable by its owner
-only:
+(The secret can also be passed with `--client-secret`, but then it ends up in
+the shell history and is visible in `ps`.) Add `--cloud` for national clouds.
+
+The resulting file contains everything needed to request new tokens, and is
+created readable by its owner only. With a certificate:
 
 ```json
 {
@@ -870,33 +981,38 @@ only:
     "scope": "https://outlook.office365.com/.default",
     "token_endpoint": "https://login.microsoftonline.com/TENANT_ID/oauth2/v2.0/token",
     "client_id": "APPLICATION_ID",
-    "client_secret": "client secret value",
+    "client_certificate_file": "/etc/tokens/relay-app.crt",
+    "client_private_key_file": "/etc/tokens/relay-app.key",
     "user": "relay@contoso.com",
     "access_token": "...",
-    "expiry": 1792505479
+    "expiry": "..."
 }
 ```
+
+With a secret, `client_secret` takes the place of the two certificate fields.
+If both are present, the certificate is used.
 
 The file may also be written by hand: `access_token` and `expiry` can be left
 out, and a token is then requested on first use. `user` is the mailbox to send
 as; it may be left out if the user name in `sasl_passwd` already is the mailbox
-address.
+address. Paths are used as they are, so with a chrooted `smtp` service they
+must be valid inside the chroot (and the files must be there).
 
-`/etc/sasl-xoauth2.conf` must still exist with `client_id` and `client_secret`
-keys (they may be empty, or hold Way A's values); the values in the token file
-take precedence. Alternatively, `grant_type` and `scope` may be set in
-`/etc/sasl-xoauth2.conf` to apply to all token files.
+`/etc/sasl-xoauth2.conf` must still exist with a `client_id` (it may hold Way
+A's values); the values in the token file take precedence. Alternatively,
+`grant_type`, `scope`, `client_certificate_file` and `client_private_key_file`
+may be set in `/etc/sasl-xoauth2.conf` to apply to all token files.
 
-To switch a token file back to Way A, run the Way A `get-token` command with
-`--overwrite-existing-token`; the tool then removes the client credentials
-settings (`grant_type`, `scope`, `client_id`, `client_secret`) from the file.
-
-Give the token file to the Postfix user as in [A3](#a3-obtain-the-initial-token).
+To switch a token file between certificate and secret, run the respective
+`get-token` command with `--overwrite-existing-token`; the settings of the
+other variant are removed. To switch a token file back to Way A, run the Way A
+`get-token` command with `--overwrite-existing-token`; the tool then removes
+the client credentials settings from the file.
 
 ##### B4. Test and Switch Over
 
 ```
-$ sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
+$ sudo -u postfix sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
 Config check passed.
 Token refresh succeeded.
 ```
@@ -907,18 +1023,47 @@ run `postmap /etc/postfix/sasl_passwd` and `postfix reload`. Keep the old token
 file until you are sure; switching back is just a matter of changing the path
 again.
 
-##### B5. Rotating the Client Secret
+##### B5. Renewing the Certificate or Rotating the Client Secret
 
-Before the secret expires, create a new one under "Certificates & secrets",
-replace `client_secret` in the token file (keeping owner and permissions), run
-`sasl-xoauth2-tool test-token-refresh`, and then delete the old secret. An
-expired secret makes token requests fail with `invalid_client`.
+Before the credential expires, add the new one in Entra ID first, so that the
+old and the new one are valid at the same time:
+
+- **Certificate:** create a new key pair and certificate as in B1 (under new
+  file names), upload the new certificate, run the B3 certificate command with
+  the new files and `--overwrite-existing-token`, and then delete the old
+  certificate in Entra ID and the old files.
+- **Client secret:** create a new secret, run the B3 secret command with
+  `--overwrite-existing-token` and enter the new secret, and then delete the
+  old secret.
+
+An expired credential makes token requests fail with `invalid_client`.
 
 ##### B6. Monitoring
 
-`sasl-xoauth2-tool test-token-refresh TOKEN_FILE` works exactly as for Way A
-and reports an expired or deleted secret. Also keep track of the secret's
-expiry date. Unlike Way A, access does not lapse when no mail is sent.
+`sudo -u postfix sasl-xoauth2-tool test-token-refresh TOKEN_FILE` works as for
+Way A and reports an expired or deleted credential, or an unreadable key (exit
+status 2). Also keep track of the expiry date of the certificate or secret.
+Unlike Way A, access does not lapse when no mail is sent.
+
+#### Shared Mailboxes
+
+To send as a [shared
+mailbox](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth#sasl-xoauth2-authentication-for-shared-mailboxes-in-office-365),
+authenticate with the token of an account that has access to it, but name
+the shared mailbox in XOAUTH2's `user` field. With sasl-xoauth2, set `user` in
+the token file to the shared mailbox's address (or use that address as the user
+name in `/etc/postfix/sasl_passwd`):
+
+- **Way A:** obtain the token as a user who has `FullAccess` to the shared
+  mailbox (and `SendAs` for its address), then add `"user":
+  "shared@contoso.com"` to the token file (or pass `--mailbox
+  shared@contoso.com` to `get-token`).
+- **Way B:** grant the application's service principal access to the shared
+  mailbox (B2, with the shared mailbox as `-Identity`), and use `--mailbox
+  shared@contoso.com`.
+
+SMTP AUTH must be enabled for the mailbox named in `user` (see [Common
+Prerequisites](#common-prerequisites)).
 
 #### Troubleshooting Microsoft 365
 
@@ -932,6 +1077,8 @@ it, with a hint, when a token request fails (see [Debugging](#debugging)).
 | `invalid_grant` (e.g. AADSTS700082, AADSTS50173) | Way A: the refresh token expired or was revoked. [Sign in again](#a5-renewing-the-token). |
 | `invalid_grant`, AADSTS7000012 | The token was obtained for a different tenant than the one in `token_endpoint`. |
 | `invalid_client` (e.g. AADSTS7000215, AADSTS7000222) | Wrong or expired client secret. For the device flow (public client), `client_secret` must be empty. |
+| `invalid_client`, AADSTS700027 | Way B with a certificate: the certificate is not (or no longer) registered for the application, or has expired. Upload it again (B1). |
+| `client certificate: ...` (no request sent) | Way B: the certificate or key file cannot be read by the Postfix user, is not PEM, the key is not RSA, is protected with a passphrase, or does not belong to the certificate. |
 | `unauthorized_client`, AADSTS700016 | The application ID is unknown in this tenant: check `client_id` and the tenant in `token_endpoint`. |
 | AADSTS65001 | Consent is missing: grant (admin) consent for the permission. |
 | `535 5.7.139 ... SmtpClientAuthentication is disabled` | SMTP AUTH is disabled for the mailbox or tenant; see [Common Prerequisites](#common-prerequisites). |
@@ -945,6 +1092,7 @@ it, with a hint, when a token request fails (see [Debugging](#debugging)).
 - [Microsoft identity platform and the OAuth 2.0 device authorization grant flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code)
 - [Microsoft identity platform and OAuth 2.0 authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow)
 - [Microsoft identity platform and the OAuth 2.0 client credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow)
+- [Microsoft identity platform application authentication certificate credentials](https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials)
 - [Refresh token lifetime](https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens)
 
 ### Proxy Support
@@ -961,24 +1109,28 @@ that is used by the curl library when refreshing the token.
 }
 ```
 
-For supported proxy schemes please refer to the [curl library documentation](https://curl.se/libcurl/c/CURLOPT_PROXY.html)
+For supported proxy schemes please refer to the [curl library documentation](https://curl.se/libcurl/c/CURLOPT_PROXY.html).
+Proxy environment variables (`https_proxy` etc.) have no effect: Postfix does
+not pass them to its delivery processes (and `sasl-xoauth2-tool` ignores them
+as well, so that its tests match). Only the token requests use the proxy; the
+SMTP connection itself is made by Postfix.
 
 ### Testing Your Configuration
 
 sasl-xoauth2 provides a tool, `sasl-xoauth2-tool`, that allows the
 semi-interative testing of configuration and token files (which is a lot more
 useful than parsing log files when trying to figure out why Postfix isn't
-delivering mail correctly).
+delivering mail correctly). Run it as the Postfix user, so that it also checks
+that Postfix can read the configuration and token files and write to the token
+directory.
 
 First, test your configuration file:
 
 ```
-$ sasl-xoauth2-tool test-config --config-file ./bad-config.conf
-sasl-xoauth2: Missing required value: client_secret
+$ sudo -u postfix sasl-xoauth2-tool test-config --config-file ./bad-config.conf
+sasl-xoauth2: Missing required value: client_id
 Config check failed.
-$ sasl-xoauth2-tool test-config --config-file ./good-config.conf
-Config check passed.
-$ sasl-xoauth2-tool test-config --config-file /etc/sasl-xoauth2.conf
+$ sudo -u postfix sasl-xoauth2-tool test-config
 Config check passed.
 ```
 
@@ -988,28 +1140,36 @@ in the system-default path.)
 Next, test your token file:
 
 ```
-$ sasl-xoauth2-tool test-token-refresh ./bad-token.json
+$ sudo -u postfix sasl-xoauth2-tool test-token-refresh ./bad-token.json
 Config check passed.
-2022-09-10 09:18:59: TokenStore::Read: file=./bad-token.json
-2022-09-10 09:18:59: TokenStore::Read: grant_type=refresh_token, refresh=<redacted, 103 bytes>, access=<redacted, 215 bytes>, user=
-2022-09-10 09:18:59: TokenStore::Refresh: attempt 1
-2022-09-10 09:18:59: TokenStore::Refresh: token_endpoint: https://accounts.google.com/o/oauth2/token
-2022-09-10 09:18:59: TokenStore::Refresh: request: grant_type=refresh_token, client_id=REDACTED, client_secret=<redacted, 35 bytes>, refresh_token=<redacted, 103 bytes>, scope=<not sent>
-2022-09-10 09:19:00: TokenStore::Refresh: code=400, response={
-  "error": "invalid_grant",
-  "error_description": "Bad Request"
-}
-2022-09-10 09:19:00: TokenStore::Refresh: error=invalid_grant, description=Bad Request
-2022-09-10 09:19:00: TokenStore::Refresh: hint: the refresh token was rejected (expired, revoked, or issued for a different client/tenant/scope); obtain a new one with 'sasl-xoauth2-tool get-token'
-2022-09-10 09:19:00: TokenStore::Refresh: request failed
+auth failed (sasl-xoauth2 0.29):
+  2026-10-20 09:18:59: TokenStore::Read: file=./bad-token.json
+  2026-10-20 09:18:59: TokenStore::Read: grant_type=refresh_token, refresh=<redacted, 103 bytes>, access=<redacted, 215 bytes>, user=
+  2026-10-20 09:18:59: TokenStore::Refresh: attempt 1
+  2026-10-20 09:18:59: TokenStore::Refresh: token_endpoint: https://accounts.google.com/o/oauth2/token
+  2026-10-20 09:18:59: TokenStore::Refresh: request: grant_type=refresh_token, client_id=REDACTED, client_secret=<redacted, 35 bytes>, refresh_token=<redacted, 103 bytes>, scope=<not sent>
+  2026-10-20 09:19:00: TokenStore::Refresh: code=400, response={\x0a  "error": "invalid_grant",\x0a  "error_description": "Bad Request"\x0a}
+  2026-10-20 09:19:00: token request for ./bad-token.json to https://accounts.google.com/o/oauth2/token failed: HTTP 400 invalid_grant: Bad Request; hint: the refresh token was rejected (expired, revoked, or issued for a different client/tenant/scope); obtain a new one with 'sasl-xoauth2-tool get-token'
 Token refresh failed.
-$ sasl-xoauth2-tool test-token-refresh ./good-token.json
+$ echo $?
+2
+$ sudo -u postfix sasl-xoauth2-tool test-token-refresh ./good-token.json
 Config check passed.
 Token refresh succeeded.
 ```
 
 (Again, you'll have to specify your configuration file with
 `--config-file <config file>` if it isn't located at the system-default path.)
+The token file is not modified. The exit status tells what kind of problem was
+found:
+
+| Exit status | Meaning |
+|---|---|
+| 0 | The configuration is valid, a token was obtained, and the token directory is writable. |
+| 1 | Transient failure, e.g. the token endpoint could not be reached or answered with HTTP 429 or 5xx. Retry later. |
+| 2 | Failure that needs action, e.g. an invalid configuration, an unreadable token file, a rejected refresh token, secret or certificate, or a token directory the user cannot write to. |
+
+`sasl-xoauth2-tool --version` prints the installed version.
 
 ### Restart Postfix
 
@@ -1042,8 +1202,93 @@ in `/etc/sasl-xoauth2.conf`. Set them when setting the initial access token:
 `sasl-xoauth2-tool` has an argument `--overwrite-existing-token` to preserve the content of these additional fields
 when manually updating an expired or invalidated token.
 
-The token file may also set `grant_type`, `scope`, `proxy`, `ca_bundle_file`,
-`ca_certs_dir` and `refresh_window` (see `sasl-xoauth2.conf(5)`).
+The token file may also set `grant_type`, `scope`, `client_certificate_file`,
+`client_private_key_file`, `proxy`, `ca_bundle_file`, `ca_certs_dir` and
+`refresh_window` (see `sasl-xoauth2.conf(5)`).
+
+A token file that sets a different `token_endpoint`, `proxy`, `ca_bundle_file`
+or `ca_certs_dir` than `/etc/sasl-xoauth2.conf` must also set its own
+`client_secret` (empty for public clients) or use a certificate: sasl-xoauth2
+does not send the client secret from the configuration file anywhere else
+than the configuration says.
+
+## Running in Production
+
+### Checklist
+
+- **Verified TLS** to the relay: `smtp_tls_security_level = secure` (or a
+  `secure` TLS policy for the relay); see [Configure Mail
+  Agent](#configure-mail-agent).
+- **Permissions:** `/etc/sasl-xoauth2.conf` `root:postfix` `0640`; token
+  directory owned by `postfix`, `0700`; token files and private keys `0600`.
+  See [A Note on Token File Permissions](#a-note-on-token-file-permissions).
+- **Ubuntu 26.04:** the `ReadWritePaths=-/etc/tokens` drop-in for Postfix, and
+  the check that Postfix can write there; see [A Note on Ubuntu
+  26.04](#a-note-on-ubuntu-2604).
+- **Monitoring** of token files and of the mail queue; see
+  [Monitoring](#monitoring).
+- For Way B, a **certificate** rather than a client secret, and a reminder for
+  its expiry date.
+- The Postfix settings below left at their defaults.
+
+### Postfix Settings That Matter
+
+sasl-xoauth2 reports every failure (an unreachable token endpoint, a rejected
+token, a broken token file) to Postfix as an authentication failure, and
+Postfix then *defers* the mail: it stays in the queue and is retried. Some
+settings change that:
+
+- `smtp_sasl_auth_soft_bounce = yes` (the default) makes Postfix defer mail
+  when the server rejects authentication. Keep it.
+- Do not enable `smtp_sasl_auth_cache_name`. It remembers a rejected
+  "password" for `smtp_sasl_auth_cache_time` (90 days by default). With
+  sasl-xoauth2, the "password" is the path to the token file, which does not
+  change when the token is fixed, so the cached failure would keep blocking
+  delivery.
+- Deferred mail is returned to the sender after `maximal_queue_lifetime` (5
+  days by default). Fix authentication problems within that time.
+- After an authentication failure, Postfix treats the relay as unavailable for
+  a while ("delivery temporarily suspended"), for all mail that goes through
+  it. If several mailboxes share one relay and should not affect each other,
+  give each its own transport (see `sender_dependent_default_transport_maps`
+  in the Postfix documentation).
+
+Token requests time out after 10 seconds (connect) or 30 seconds (total). A
+delivery process waits up to 45 seconds for another process that is already
+requesting a token for the same file, so authentication can take up to about
+75 seconds when the token endpoint is slow; with a healthy endpoint, many
+parallel deliveries share a single token request.
+
+### Monitoring
+
+- **Token files:** run `sasl-xoauth2-tool test-token-refresh` regularly, as the
+  Postfix user, for each token file. Once a day is enough. It exits with 1 for
+  transient and 2 for permanent problems (see [Testing Your
+  Configuration](#testing-your-configuration)). For example, in
+  `/etc/cron.d/sasl-xoauth2`:
+
+  ```
+  17 6 * * * postfix /usr/bin/sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com >/dev/null 2>&1 || logger -p mail.err -t sasl-xoauth2-check "token check for relay@contoso.com failed (exit status $?)"
+  ```
+
+  The check requests a token but does not store it. For Way A, it therefore
+  does not keep an unused refresh token alive (see [A6](#a6-monitoring)).
+- **Logs:** alert on `[sasl-xoauth2] auth failed` and on `[sasl-xoauth2]
+  unable to update token file` in the mail log. The plugin logs through
+  Postfix's syslog connection; if Postfix writes its own log file
+  (`maillog_file`), look for the plugin's messages in the system log
+  (`journalctl`) instead.
+- **Queue:** alert on deferred mail (e.g. `postqueue -j`, or the number of
+  files in `/var/spool/postfix/deferred`).
+
+### Backups
+
+Token files, private keys and `/etc/sasl-xoauth2.conf` contain credentials.
+Back them up only to storage that is at least as well protected (encrypted,
+restricted access). For Way A, a restored older token file may still work, as
+Microsoft and Google do not revoke a refresh token when they issue a new one;
+if it does not, sign in again. For Way B, a new certificate or secret can
+always be created instead of restoring one.
 
 ## Debugging
 
@@ -1056,12 +1301,18 @@ settings in `/etc/sasl-xoauth2.conf`, writes it to syslog, prefixed
 
 | Setting | Default | Effect |
 |---|---|---|
-| `log_to_syslog_on_failure` | `yes` | When authentication fails, log the last line of the trace (usually the reason, e.g. the provider's error and a hint). `no` disables all logging on failure. |
-| `log_full_trace_on_failure` | `no` | When authentication fails, log the whole trace instead of only its last line. |
+| `log_to_syslog_on_failure` | `yes` | When authentication fails, log one line with the reason: which token file, which endpoint, the provider's error (e.g. HTTP status and AADSTS code) and a hint. `no` disables all logging on failure. |
+| `log_full_trace_on_failure` | `no` | When authentication fails, log the whole trace instead of only that line. |
 | `always_log_to_syslog` | `no` | Log every trace line immediately, also for successful authentications. |
 
 Tokens and secrets are always redacted; user names, token file paths, token
-endpoints and the provider's error responses are logged. The recommended
+endpoints and the provider's error responses are logged (with control
+characters escaped and long responses cut, so they cannot forge or flood log
+lines). Every failure message names the plugin version, e.g. `[sasl-xoauth2]
+auth failed (sasl-xoauth2 0.29): token request for /etc/tokens/relay@contoso.com
+to https://login.microsoftonline.com/... failed: HTTP 400 invalid_grant: ...`.
+Independently of these settings, sasl-xoauth2 logs an error when it obtained a
+new token but could not store it in the token file. The recommended
 setting for production is the default, which may be spelled out to document
 it:
 

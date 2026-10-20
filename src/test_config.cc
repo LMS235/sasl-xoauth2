@@ -1,7 +1,11 @@
+#include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
 #include <sasl/sasl.h>
 #include <string.h>
+#include <unistd.h>
+
+#include <vector>
 
 #include "config.h"
 #include "log.h"
@@ -9,15 +13,21 @@
 
 namespace {
 
+// Exit codes, for monitoring: whether a failure needs someone to act.
+constexpr int kExitOk = 0;
+constexpr int kExitTransient = 1;  // e.g. network problem, provider outage.
+constexpr int kExitPermanent = 2;  // e.g. invalid config, rejected token.
+
 struct Options {
   std::string config_path;
   std::string token_path;
 };
 
 bool TryParseCommandLine(int argc, char **argv, Options *out) {
-  const char *kShortOptions = "c:r:";
+  const char *kShortOptions = "c:r:V";
   const option kLongOptions[] = {{"config", required_argument, nullptr, 'c'},
                                  {"token", required_argument, nullptr, 'r'},
+                                 {"version", no_argument, nullptr, 'V'},
                                  {nullptr, 0, nullptr, 0}};
 
   while (true) {
@@ -32,6 +42,10 @@ bool TryParseCommandLine(int argc, char **argv, Options *out) {
       case 'r':
         out->token_path = optarg;
         break;
+
+      case 'V':
+        printf("sasl-xoauth2 %s\n", SASL_XOAUTH2_VERSION);
+        exit(kExitOk);
 
       default:
         return false;
@@ -48,7 +62,13 @@ void PrintUsage(const std::string &base_name) {
           "  -c, --config=<file>  use <file> for configuration rather than\n"
           "                       system default\n"
           "  -r, --token=<file>   attempt to request a token from the OAuth\n"
-          "                       provider using the refresh token in <file>\n",
+          "                       provider using the token file <file> (which\n"
+          "                       is not modified)\n"
+          "  -V, --version        print the version and exit\n\n"
+          "Exit status: 0 on success, 1 on a transient failure (e.g. network\n"
+          "problem or provider outage), 2 on a failure that needs action\n"
+          "(e.g. invalid configuration, rejected token, unwritable token\n"
+          "directory).\n",
           base_name.c_str());
 }
 
@@ -58,10 +78,25 @@ Options ParseCommandLine(int argc, char **argv) {
 
   if (!TryParseCommandLine(argc, argv, &parsed_options)) {
     PrintUsage(base_name);
-    exit(EXIT_FAILURE);
+    exit(kExitPermanent);
   }
 
   return parsed_options;
+}
+
+// The plugin replaces the token file by writing a new file next to it and
+// takes a lock file there, so the directory must be writable.
+bool CheckTokenDirectoryWritable(const std::string &token_path) {
+  std::vector<char> buf(token_path.begin(), token_path.end());
+  buf.push_back('\0');
+  const std::string dir = dirname(buf.data());
+  if (access(dir.c_str(), W_OK) == 0) return true;
+  printf(
+      "Token directory %s is not writable for this user (%s); sasl-xoauth2 "
+      "could not store refreshed tokens. Check owner and permissions (and, "
+      "on systemd, ReadWritePaths for the mail system).\n",
+      dir.c_str(), strerror(errno));
+  return false;
 }
 
 }  // namespace
@@ -72,7 +107,7 @@ int main(int argc, char **argv) {
   sasl_xoauth2::Config::EnableLoggingToStderr();
   if (sasl_xoauth2::Config::Init(options.config_path) != SASL_OK) {
     printf("Config check failed.\n");
-    return EXIT_FAILURE;
+    return kExitPermanent;
   }
   printf("Config check passed.\n");
 
@@ -86,15 +121,17 @@ int main(int argc, char **argv) {
     if (!token_store) {
       logger->Flush();
       printf("Failed to read token.\n");
-      return EXIT_FAILURE;
+      return kExitPermanent;
     }
     if (token_store->Refresh() != SASL_OK) {
       logger->Flush();
       printf("Token refresh failed.\n");
-      return EXIT_FAILURE;
+      return token_store->last_error_permanent() ? kExitPermanent
+                                                 : kExitTransient;
     }
     printf("Token refresh succeeded.\n");
+    if (!CheckTokenDirectoryWritable(options.token_path)) return kExitPermanent;
   }
 
-  return EXIT_SUCCESS;
+  return kExitOk;
 }

@@ -30,8 +30,8 @@ void EnableLoggingForTesting();
 std::string RedactSecret(const std::string &secret);
 
 // Escapes control characters (as \xNN) in values that come from outside, so
-// they cannot forge or split log lines.
-std::string EscapeForLog(const std::string &value);
+// they cannot forge or split log lines, and cuts them to |max_length| bytes.
+std::string EscapeForLog(const std::string &value, size_t max_length = 2048);
 
 // Log implementation interface, not for direct use.
 class LogImpl {
@@ -65,6 +65,10 @@ class Log {
   // printf-style; the attribute lets the compiler check arguments (this is a
   // member function, so argument 1 is the implicit |this|).
   void Write(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+  // Like Write(), but also makes the line the one-line summary logged when
+  // authentication fails (unless a full trace is logged): the reason, not
+  // merely the last step.
+  void Error(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
   void Flush();
   void SetFlushOnDestroy();
 
@@ -78,7 +82,10 @@ class Log {
   Options options_;
   // Nothing would ever be printed (TARGET_NONE), so skip formatting entirely.
   const bool discard_;
+  void WriteLine(std::string line, bool is_error);
+
   std::string summary_;
+  std::string error_summary_;
   std::vector<std::string> lines_;
 };
 

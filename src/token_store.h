@@ -38,6 +38,11 @@ class TokenStore {
   std::string user() const { return user_.value_or(""); }
   bool has_user() const { return user_.has_value(); }
 
+  // Whether the last failure needs someone to act (e.g. a rejected refresh
+  // token or client secret, an unreadable file) rather than being transient
+  // (e.g. a network problem or a provider outage).
+  bool last_error_permanent() const { return last_error_permanent_; }
+
  private:
   TokenStore(Log *log, const std::string &path, bool enable_updates);
 
@@ -45,6 +50,8 @@ class TokenStore {
   // the store changes.
   int Read();
   int Write();
+  int RequestToken();
+  int Fail(bool permanent, int err);
 
   int RefreshWindow() const;
   std::string GrantType() const;
@@ -67,6 +74,8 @@ class TokenStore {
   std::optional<std::string> override_ca_certs_dir_;
   std::optional<std::string> override_grant_type_;
   std::optional<std::string> override_scope_;
+  std::optional<std::string> override_client_certificate_file_;
+  std::optional<std::string> override_client_private_key_file_;
   std::optional<int> override_refresh_window_;
 
   std::string access_;
@@ -75,6 +84,7 @@ class TokenStore {
   time_t expiry_ = 0;
 
   int refresh_attempts_ = 0;
+  bool last_error_permanent_ = false;
 };
 
 }  // namespace sasl_xoauth2
