@@ -2,7 +2,11 @@
 
 ## Disclaimer
 
-This is not an officially supported Google product.
+This is not an officially supported Google or Microsoft product, nor a product
+of any other mail or identity provider, and it is not affiliated with or
+endorsed by any of them. It is provided "as is", without any warranty and
+without any claim to completeness (see the Apache License 2.0 in
+[COPYING](COPYING)).
 
 ## Background
 
