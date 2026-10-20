@@ -133,8 +133,12 @@ package, if `dpkg` lists one, with `sudo apt remove sasl-xoauth2`):
 $ sudo rm -rf /usr/local/bin/sasl-xoauth2-tool /usr/local/lib/sasl2/libsasl-xoauth2.so* \
     /usr/local/lib/sasl-xoauth2 /usr/local/etc/sasl-xoauth2.conf \
     /usr/local/share/man/man*/sasl-xoauth2*
+$ sudo rmdir --ignore-fail-on-non-empty /usr/local/lib/sasl2
 $ hash -r
 ```
+
+Only the sasl-xoauth2 plugin is removed from `/usr/local/lib/sasl2`; the
+directory itself is only removed if no other SASL plugins are left in it.
 
 (`hash -r` makes the current shell forget the old location of
 `sasl-xoauth2-tool`.) Then check that the new installation is the one in use:
