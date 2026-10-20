@@ -84,7 +84,12 @@ $ saslpluginviewer -c -m XOAUTH2
 ...
 Plugin "sasl-xoauth2" [loaded],         API version: 4
         SASL mechanism: XOAUTH2, best SSF: 60
+        security flags: NO_ANONYMOUS|NO_PLAINTEXT|PASS_CREDENTIALS
+        features: WANT_CLIENT_FIRST|PROXY_AUTHENTICATION
 ```
+
+`[loaded]` also means that `/etc/sasl-xoauth2.conf` was read successfully; a
+missing or invalid configuration prevents the plugin from loading.
 
 On Ubuntu 26.04, Postfix's `smtp` service does not run chrooted by default
 (see [A Note on chroot](#a-note-on-chroot)), but its systemd sandbox needs one
@@ -231,7 +236,7 @@ the "SSF" value:
 ```
 Plugin "sasl-xoauth2" [loaded],         API version: 4
         SASL mechanism: XOAUTH2, best SSF: 60
-        security flags: NO_ANONYMOUS|PASS_CREDENTIALS
+        security flags: NO_ANONYMOUS|NO_PLAINTEXT|PASS_CREDENTIALS
         features: WANT_CLIENT_FIRST|PROXY_AUTHENTICATION
 Plugin "login" [loaded],        API version: 4
         SASL mechanism: LOGIN, best SSF: 0
