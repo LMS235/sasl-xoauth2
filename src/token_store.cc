@@ -90,7 +90,11 @@ class FileLock {
   FileLock(const FileLock &) = delete;
   FileLock &operator=(const FileLock &) = delete;
 
-  bool Acquire(Log *log, const std::string &path) {
+  // |owner_path| is the file the lock protects: when running as root (e.g.
+  // a scheduled refresh), a lock file created here gets its owner, so that
+  // the mail system can still use it.
+  bool Acquire(Log *log, const std::string &path,
+               const std::string &owner_path) {
     fd_ = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     // flock() works on read-only descriptors too, e.g. for a lock file that
     // another user created.
@@ -100,6 +104,15 @@ class FileLock {
       log->Write("FileLock: unable to open %s: %s", path.c_str(),
                  strerror(errno));
       return false;
+    }
+    struct stat lock_st = {}, owner_st = {};
+    if (geteuid() == 0 && fstat(fd_, &lock_st) == 0 &&
+        stat(owner_path.c_str(), &owner_st) == 0 &&
+        (lock_st.st_uid != owner_st.st_uid ||
+         lock_st.st_gid != owner_st.st_gid) &&
+        fchown(fd_, owner_st.st_uid, owner_st.st_gid) != 0) {
+      log->Write("FileLock: unable to change owner of %s: %s", path.c_str(),
+                 strerror(errno));
     }
     for (int waited_ms = 0;; waited_ms += kLockPollMs) {
       if (flock(fd_, LOCK_EX | LOCK_NB) == 0) return true;
@@ -182,10 +195,22 @@ int WriteFileAtomically(Log *log, const std::string &path,
   // Compare with the group the new file actually got (which, in a setgid
   // directory, is the directory's group rather than the writer's).
   struct stat created = {};
-  const gid_t new_gid =
-      (fstat(fd, &created) == 0) ? created.st_gid : static_cast<gid_t>(-1);
-  if (have_existing && existing.st_gid != new_gid &&
-      fchown(fd, static_cast<uid_t>(-1), existing.st_gid) != 0) {
+  const bool have_created = (fstat(fd, &created) == 0);
+  const gid_t new_gid = have_created ? created.st_gid : static_cast<gid_t>(-1);
+  // Running as root (e.g. a scheduled refresh), keep the file's owner: a
+  // token file that suddenly belongs to root is unreadable for the mail
+  // system.
+  if (have_existing && have_created && geteuid() == 0 &&
+      (existing.st_uid != created.st_uid || existing.st_gid != new_gid)) {
+    if (fchown(fd, existing.st_uid, existing.st_gid) != 0) {
+      log->Write("TokenStore::Write: unable to keep owner of %s: %s",
+                 path.c_str(), strerror(errno));
+      unlink(temp_path.c_str());
+      close(fd);
+      return SASL_FAIL;
+    }
+  } else if (have_existing && existing.st_gid != new_gid &&
+             fchown(fd, static_cast<uid_t>(-1), existing.st_gid) != 0) {
     // The new file belongs to a different group, which must not inherit the
     // old group's access.
     log->Write("TokenStore::Write: unable to keep group of %s: %s",
@@ -336,6 +361,7 @@ bool TokenStore::ReloadIfRefreshedElsewhere() {
 
 int TokenStore::Refresh() {
   last_error_permanent_ = false;
+  last_write_failed_ = false;
   if (refresh_attempts_ >= kMaxRefreshAttempts) {
     log_->Error("token request for %s: exceeded maximum attempts",
                 path_.c_str());
@@ -350,7 +376,7 @@ int TokenStore::Refresh() {
   // refresh tokens, overwriting) their own. Without the lock, carry on as
   // before rather than failing delivery.
   FileLock lock;
-  if (enable_updates_ && lock.Acquire(log_, path_ + ".lock") &&
+  if (enable_updates_ && lock.Acquire(log_, path_ + ".lock", path_) &&
       ReloadIfRefreshedElsewhere()) {
     return SASL_OK;
   }
@@ -359,6 +385,7 @@ int TokenStore::Refresh() {
   if (err != SASL_OK) return err;
 
   if (Write() != SASL_OK) {
+    last_write_failed_ = true;
     // The new token works; only storing it failed (e.g. a read-only file
     // system, a full disk, or wrong ownership of the token directory). Use it
     // anyway, but report the problem regardless of the log settings: until it

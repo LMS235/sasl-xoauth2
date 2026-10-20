@@ -66,7 +66,12 @@ $ cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/et
 $ cmake --build build -j"$(nproc)"
 $ ctest --test-dir build
 $ sudo cmake --install build
+$ sudo chown root:postfix /etc/sasl-xoauth2.conf
 ```
+
+(The last step lets the Postfix user read the configuration, see [A Note on
+Token File Permissions](#a-note-on-token-file-permissions); it is only needed
+after the first installation.)
 
 The build is optimized and hardened by default (`RelWithDebInfo`, with
 `_FORTIFY_SOURCE`, stack protector and full RELRO), and the plugin exports
@@ -78,7 +83,7 @@ SASL library (and thus Postfix) does not look, and the configuration file to
 | File | Purpose |
 |---|---|
 | `/usr/lib/x86_64-linux-gnu/sasl2/libsasl-xoauth2.so` | The SASL plugin |
-| `/etc/sasl-xoauth2.conf` | Configuration file template (see [Configuration](#configuration)), mode `0640`; only installed if the file does not exist yet, an existing configuration is never overwritten |
+| `/etc/sasl-xoauth2.conf` | Configuration file template (see [Configuration](#configuration)), owner `root:root`, mode `0640`; only installed if the file does not exist yet, an existing configuration is never overwritten |
 | `/usr/bin/sasl-xoauth2-tool` | Tool to obtain tokens and test the configuration |
 | `/usr/lib/x86_64-linux-gnu/sasl-xoauth2/test-config` | Helper used by `sasl-xoauth2-tool test-config` and `test-token-refresh` |
 | `/usr/share/man/man5/sasl-xoauth2.conf.5`, `/usr/share/man/man1/sasl-xoauth2-tool.1` | Man pages |
@@ -87,7 +92,7 @@ SASL library (and thus Postfix) does not look, and the configuration file to
 multiarch directory.) Check that SASL finds the plugin:
 
 ```
-$ saslpluginviewer -c -m XOAUTH2
+$ sudo saslpluginviewer -c -m XOAUTH2
 ...
 Plugin "sasl-xoauth2" [loaded],         API version: 4
         SASL mechanism: XOAUTH2, best SSF: 60
@@ -96,7 +101,8 @@ Plugin "sasl-xoauth2" [loaded],         API version: 4
 ```
 
 `[loaded]` also means that `/etc/sasl-xoauth2.conf` was read successfully; a
-missing or invalid configuration prevents the plugin from loading.
+missing, unreadable or invalid configuration prevents the plugin from loading.
+(Hence `sudo`: the configuration is not readable for other users.)
 
 On Ubuntu 26.04, Postfix's `smtp` service does not run chrooted by default
 (see [A Note on chroot](#a-note-on-chroot)), but its systemd sandbox needs one
@@ -133,15 +139,28 @@ touched.
    $ cd sasl-xoauth2
    $ git log -1 --oneline
    $ sudo cp -a /etc/sasl-xoauth2.conf /etc/sasl-xoauth2.conf.bak
+   $ git remote -v
    ```
+
+   The remote must be this repository, `LMS235/sasl-xoauth2`. A checkout of
+   the original project (`tarickb/sasl-xoauth2`, e.g. from installing 0.28 or
+   earlier) does not get these versions with `git pull`; switch it first:
+
+   ```
+   $ git remote set-url origin https://github.com/LMS235/sasl-xoauth2.git
+   ```
+
+   If the directory is not a git checkout (e.g. a release tarball), clone the
+   repository again instead.
 
 1. Fetch the new version, and read what changed (new entries at the top of
    `ChangeLog`; check in particular whether any configuration changes are
-   needed):
+   needed, and, when coming from 0.28 or earlier, see [Upgrading to
+   0.29](#upgrading-to-029)):
 
    ```
    $ git pull
-   $ head -40 ChangeLog
+   $ sed -n '1,/^ -- /p' ChangeLog
    ```
 
 1. Build, test and install exactly as for a new installation:
@@ -158,10 +177,15 @@ touched.
 1. Check that the new plugin loads, and that tokens can still be refreshed:
 
    ```
-   $ saslpluginviewer -c -m XOAUTH2
-   $ sasl-xoauth2-tool test-config
-   $ sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
+   $ sudo saslpluginviewer -c -m XOAUTH2
+   $ sasl-xoauth2-tool --version
+   $ sudo -u postfix sasl-xoauth2-tool test-config
+   $ sudo -u postfix sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
    ```
+
+   `--version` must show the new version for the tool, `test-config` and the
+   plugin, and exit without a warning (see [Testing Your
+   Configuration](#testing-your-configuration)).
 
 1. Let Postfix load the new plugin. Running `smtp` processes keep the old one
    until they are replaced; `postfix reload` replaces them once they are done
@@ -178,12 +202,93 @@ To go back to the previous version, check out the version noted in step 1
 (`git checkout <commit>`), and repeat steps 3 to 5. Versions before the fix
 for [LMS235/sasl-xoauth2#3](https://github.com/LMS235/sasl-xoauth2/pull/3)
 overwrite `/etc/sasl-xoauth2.conf` when installing; restore it from the copy
-made in step 1. Afterwards, `git checkout master` returns to the current
-version.
+made in step 1, and set its owner and mode again (`sudo chown root:postfix
+/etc/sasl-xoauth2.conf && sudo chmod 640 /etc/sasl-xoauth2.conf`). Versions
+before 0.29 have no `refresh-token` command: disable the [daily
+refresh](#daily-token-refresh) (`sudo systemctl disable --now
+sasl-xoauth2-refresh.timer`) while running one. Afterwards, `git checkout
+master` returns to the current version.
 
 If the build fails after an update with errors about the CMake cache (for
 example after a major Ubuntu upgrade), remove the build directory (`rm -rf
 build`) and repeat step 3.
+
+### Upgrading to 0.29
+
+Version 0.29 changes several defaults for security and reliability. When
+upgrading from 0.28 or earlier, in addition to the steps above:
+
+1. **Install the new build dependency** before building, or the `cmake` step
+   fails (`Could NOT find OpenSSL`):
+
+   ```
+   $ sudo apt install libssl-dev
+   ```
+
+   Remove the build directory once (`sudo rm -rf build`; earlier instructions
+   ran `make install` in it as root): the default build type is now an
+   optimized, hardened build, and the build commands changed (see [Ubuntu
+   26.04 LTS](#ubuntu-2604-lts)).
+1. **Remove older copies** below `/usr/local`, and a distribution package of
+   sasl-xoauth2, if any, *before* running `sudo cmake --install build` (see
+   [Removing Older Installations](#removing-older-installations)): removing
+   the package afterwards would delete the newly installed files.
+1. **Tighten permissions.** Earlier versions rewrote token files with the
+   process umask, which usually made them readable for all users, and
+   installed the configuration world-readable:
+
+   ```
+   $ sudo chown -R postfix:postfix /etc/tokens
+   $ sudo chmod 700 /etc/tokens
+   $ sudo find /etc/tokens -type f -exec chmod 600 {} +
+   $ sudo chown root:postfix /etc/sasl-xoauth2.conf
+   $ sudo chmod 640 /etc/sasl-xoauth2.conf
+   ```
+
+   (With chroot, the token files are below `/var/spool/postfix/etc/tokens`.)
+1. **Require verified TLS** to the relay: change `smtp_tls_security_level =
+   encrypt` (or `may`) to `secure`, add `smtp_tls_secure_cert_match =
+   nexthop`, and set `smtp_sasl_security_options` and
+   `smtp_sasl_tls_security_options` to `noanonymous` (see [Configure Mail
+   Agent](#configure-mail-agent)); check the relay with `posttls-finger`
+   before reloading Postfix.
+1. **Ubuntu 26.04:** earlier instructions relaxed Postfix's sandbox with
+   `ProtectSystem=true`. In `sudo systemctl edit postfix.service`, remove that
+   line and add `ReadWritePaths=-/etc/tokens` instead (add the drop-in if you
+   had none), then `sudo systemctl restart postfix` (`postfix reload` does not
+   apply unit changes) and run the check from [A Note on Ubuntu
+   26.04](#a-note-on-ubuntu-2604).
+1. **Check `refresh_window`:** a `refresh_window` in `/etc/sasl-xoauth2.conf`
+   had no effect before 0.29 and now does; the default changed from 10 to 300
+   seconds. Values above 1800, or anything that is not an integer, are now
+   rejected: in the configuration, they prevent the plugin from loading (all
+   mail is deferred); in a token file, they make the token file unreadable.
+   `"refresh_window": "0"` entries that earlier versions wrote into token files
+   are ignored and removed. Before reloading Postfix, check the configuration
+   with `sudo -u postfix sasl-xoauth2-tool test-config` and each token file with
+   `sudo -u postfix sasl-xoauth2-tool test-token-refresh`.
+1. **Token files that override the connection:** a token file that sets its
+   own `token_endpoint`, `proxy`, `ca_bundle_file` or `ca_certs_dir` no longer
+   gets the `client_secret` from `/etc/sasl-xoauth2.conf`; give it its own
+   `client_secret` (empty for public clients). `test-token-refresh` reports
+   such files.
+1. **Monitoring scripts:** `test-token-refresh` now exits with 1 (transient)
+   or 2 (needs action) instead of always 1, and also fails when the token
+   directory is not writable. Replace periodic `test-token-refresh` checks by
+   the [daily refresh](#daily-token-refresh), which also keeps unused refresh
+   tokens alive.
+1. **With chroot:** `cmake --install` does not update the CA certificate hook.
+   Install the new script again and run it (it now also removes certificates
+   that are gone from the system):
+
+   ```
+   $ sudo install -m 755 scripts/postfix-sasl-xoauth2-update-ca-certs /etc/ca-certificates/update.d/
+   $ sudo /etc/ca-certificates/update.d/postfix-sasl-xoauth2-update-ca-certs
+   ```
+1. **Optionally, for Way B:** switch from a client secret to a certificate
+   (see [Way B](#way-b-app-only-access-with-client-credentials)).
+
+Then run `sudo postfix reload`, send a test mail, and check the mail log.
 
 ### Removing Older Installations
 
@@ -201,8 +306,11 @@ $ dpkg -l | grep -i xoauth2
 ```
 
 If the configuration in use was `/usr/local/etc/sasl-xoauth2.conf`, copy it to
-`/etc/sasl-xoauth2.conf` first. Then remove the old files (and a distribution
-package, if `dpkg` lists one, with `sudo apt remove sasl-xoauth2`):
+`/etc/sasl-xoauth2.conf` first. Remove a distribution package, if `dpkg` lists
+one, *before* installing with `sudo cmake --install build` (`sudo apt remove
+sasl-xoauth2`): it owns the same files below `/usr`, so removing it afterwards
+deletes the new installation (if that happened, run `sudo cmake --install
+build` again). Then remove the old files:
 
 ```
 $ sudo rm -rf /usr/local/bin/sasl-xoauth2-tool /usr/local/lib/sasl2/libsasl-xoauth2.so* \
@@ -229,17 +337,31 @@ TEST_TOOL_PATH = '/usr/lib/x86_64-linux-gnu/sasl-xoauth2/test-config'
 (`/bin` is a link to `/usr/bin` on current systems; no path below `/usr/local`
 may appear.)
 
-To uninstall, remove the files listed in `build/install_manifest.txt`, except
-the configuration file:
+To uninstall, first disable what you set up around it (the [daily
+refresh](#daily-token-refresh) timer or cron job, the CA certificate hook, the
+systemd drop-in for Postfix, and the Postfix settings), then remove the files
+listed in `build/install_manifest.txt` of the build directory the installation
+was made from, except the configuration file:
 
 ```
+$ sudo systemctl disable --now sasl-xoauth2-refresh.timer
+$ sudo rm -f /etc/systemd/system/sasl-xoauth2-refresh.{service,timer} /etc/cron.d/sasl-xoauth2 \
+    /etc/ca-certificates/update.d/postfix-sasl-xoauth2-update-ca-certs
 $ grep -v '\.conf$' build/install_manifest.txt | sudo xargs -d '\n' rm -v
+$ sudo rmdir /usr/lib/x86_64-linux-gnu/sasl-xoauth2
 ```
+
+`/etc/sasl-xoauth2.conf` and the token files are kept; remove them as well if
+they are no longer needed (they contain credentials).
 
 ### Other Distributions
 
-The same steps work on other distributions with the equivalent packages (on
-Debian and older Ubuntu releases the package names above are the same).
+The same steps should work on other distributions with the equivalent
+packages, but only Ubuntu 26.04 has been tested. Package names may differ
+(e.g. `python3-argparse-manpage` is not available everywhere; without it, only
+the man page of `sasl-xoauth2-tool` is missing). CMake 3.13 or later is
+required; `ctest --test-dir build` needs CMake 3.20 (with older versions, run
+`(cd build && ctest)`).
 
 ## System-Specific Notes
 
@@ -312,7 +434,7 @@ same "SSF" setting of "0". This made SASL's automatic detection of which
 plug-in to use non-deterministic. Now, with the higher SSF of "60" for
 "xoauth2", providers offering OAUTH2 will be handled via the xoauth2 plug-in.
 
-You can check the effective value by calling `pluginviewer -c` (on Debian/Ubuntu it’s installed as `/usr/sbin/saslpluginviewer` in the `sasl2-bin` package); look for
+You can check the effective value by calling `sudo pluginviewer -c` (on Debian/Ubuntu it’s installed as `/usr/sbin/saslpluginviewer` in the `sasl2-bin` package); look for
 the "SSF" value:
 
 ```
@@ -467,7 +589,7 @@ If you see an error message similar to the following, you may need to copy over
 root CA certificates for the TLS handshake to work within sasl-xoauth2:
 
 ```
-TokenStore::Refresh: http error: error setting certificate verify locations: ...
+[sasl-xoauth2] auth failed (sasl-xoauth2 0.29): token request for /etc/tokens/... to https://... failed: error setting certificate file: /etc/ssl/certs/ca-certificates.crt
 ```
 
 To copy certificates manually, assuming the Postfix root is
@@ -583,10 +705,6 @@ chroot](#a-note-on-chroot)):
 }
 ```
 
-In my configuration, chroot is enabled and so even though
-`/etc/postfix/sasl_passwd` specifies `/etc/tokens/username@domain.com`,
-my token file is `/var/spool/postfix/etc/tokens/username@domain.com`.
-
 It may be necessary to adjust permissions on the token file so that Postfix (or,
 more accurately, sasl-xoauth2 running as the Postfix user) can update it. See
 [A Note on Token File Permissions](#a-note-on-token-file-permissions).
@@ -657,7 +775,8 @@ documentation](https://learn.microsoft.com/en-us/entra/identity-platform/v2-prot
 Token files contain secrets; see [A Note on Token File
 Permissions](#a-note-on-token-file-permissions).
 
-> [!WARNING] When using Microsoft's HVE endpoint (smtp-hve.office365.com), set
+> [!WARNING]
+> When using Microsoft's HVE endpoint (smtp-hve.office365.com), set
 > `refresh_window` in the configuration file to at least 600 seconds (10
 > minutes) to prevent the "501 5.5.127 Invalid XOAUTH2 auth data - Token will
 > expire soon" error. (Before version 0.29, a `refresh_window` set in the
@@ -683,7 +802,7 @@ environment that is not listed, override the login endpoint and scope with
 `--login-base` and `--scope`:
 
 ```shell
-$ sasl-xoauth2-tool get-token outlook \
+$ sudo -u postfix sasl-xoauth2-tool get-token outlook \
     PATH_TO_TOKENS_FILE \
     --client-id=CLIENT_ID \
     --tenant=TENANT_ID \
@@ -802,16 +921,16 @@ restart: the token file is read for every authentication.
 
 ##### A6. Monitoring
 
-Run `sudo -u postfix sasl-xoauth2-tool test-token-refresh TOKEN_FILE` regularly
-(for example daily from cron or your monitoring system); see [Monitoring](#monitoring).
-It prints the reason and exits with status 2 when the refresh token no longer
-works (`invalid_grant`), 1 for transient problems. It does not modify the
-token file.
+Set up the [daily token refresh](#daily-token-refresh). It requests and stores
+a new token once a day, which keeps the refresh token alive (Microsoft lets an
+unused refresh token expire after 90 days; each refresh issues a new one), and
+it fails with exit status 2 and the reason when the refresh token no longer
+works (`invalid_grant`), or 1 for transient problems.
 
-Note that only Postfix's own token refreshes (which happen when mail is sent)
-extend the life of the stored refresh token; the monitoring check does not. A
-relay that sends no mail for 90 days therefore loses its refresh token -- the
-check reports this, but cannot prevent it.
+Without it, only Postfix's own token refreshes (which happen when mail is sent)
+extend the life of the stored refresh token. `sasl-xoauth2-tool
+test-token-refresh` only checks a token file and does not modify it, so it
+does not keep the refresh token alive.
 
 ##### Variant: Authorization Code Flow
 
@@ -825,7 +944,7 @@ client flows" is not needed for this variant).
 Then run the tool without `--use-device-flow`:
 
 ```shell
-$ sasl-xoauth2-tool get-token outlook \
+$ sudo -u postfix sasl-xoauth2-tool get-token outlook \
     /etc/tokens/relay@contoso.com \
     --client-id=APPLICATION_ID \
     --tenant=TENANT_ID
@@ -996,7 +1115,13 @@ The file may also be written by hand: `access_token` and `expiry` can be left
 out, and a token is then requested on first use. `user` is the mailbox to send
 as; it may be left out if the user name in `sasl_passwd` already is the mailbox
 address. Paths are used as they are, so with a chrooted `smtp` service they
-must be valid inside the chroot (and the files must be there).
+must be valid inside the chroot (and the files must be there). `get-token`
+writes the paths as given on the host (e.g. `/var/spool/postfix/etc/tokens/...`);
+with chroot, change `client_certificate_file` and `client_private_key_file` in
+the token file to the paths inside the chroot (e.g.
+`/etc/tokens/relay-app.crt`) afterwards. (`test-token-refresh` and
+`refresh-token` run outside the chroot and therefore cannot check such a file;
+check it by sending a test mail.)
 
 `/etc/sasl-xoauth2.conf` must still exist with a `client_id` (it may hold Way
 A's values); the values in the token file take precedence. Alternatively,
@@ -1019,7 +1144,7 @@ Token refresh succeeded.
 
 If the mailbox previously used Way A, write the new token file under a
 different name first, test it, then point `/etc/postfix/sasl_passwd` at it and
-run `postmap /etc/postfix/sasl_passwd` and `postfix reload`. Keep the old token
+run `sudo postmap /etc/postfix/sasl_passwd` and `sudo postfix reload`. Keep the old token
 file until you are sure; switching back is just a matter of changing the path
 again.
 
@@ -1040,10 +1165,10 @@ An expired credential makes token requests fail with `invalid_client`.
 
 ##### B6. Monitoring
 
-`sudo -u postfix sasl-xoauth2-tool test-token-refresh TOKEN_FILE` works as for
-Way A and reports an expired or deleted credential, or an unreadable key (exit
-status 2). Also keep track of the expiry date of the certificate or secret.
-Unlike Way A, access does not lapse when no mail is sent.
+The [daily token refresh](#daily-token-refresh) works as for Way A and reports
+an expired or deleted credential, or an unreadable key (exit status 2). Also
+keep track of the expiry date of the certificate or secret. Unlike Way A,
+access does not lapse when no mail is sent.
 
 #### Shared Mailboxes
 
@@ -1111,9 +1236,10 @@ that is used by the curl library when refreshing the token.
 
 For supported proxy schemes please refer to the [curl library documentation](https://curl.se/libcurl/c/CURLOPT_PROXY.html).
 Proxy environment variables (`https_proxy` etc.) have no effect: Postfix does
-not pass them to its delivery processes (and `sasl-xoauth2-tool` ignores them
-as well, so that its tests match). Only the token requests use the proxy; the
-SMTP connection itself is made by Postfix.
+not pass them to its delivery processes (and `sasl-xoauth2-tool test-config`,
+`test-token-refresh` and `refresh-token` ignore them as well, so that their
+tests match; `get-token` does use them). Only the token requests use the proxy;
+the SMTP connection itself is made by Postfix.
 
 ### Testing Your Configuration
 
@@ -1135,7 +1261,8 @@ Config check passed.
 ```
 
 (Specifying the path is only required if your configuration file isn't located
-in the system-default path.)
+in the system-default path; it must be readable for the Postfix user, so not,
+for example, in your home directory.)
 
 Next, test your token file:
 
@@ -1169,12 +1296,27 @@ found:
 | 1 | Transient failure, e.g. the token endpoint could not be reached or answered with HTTP 429 or 5xx. Retry later. |
 | 2 | Failure that needs action, e.g. an invalid configuration, an unreadable token file, a rejected refresh token, secret or certificate, or a token directory the user cannot write to. |
 
-`sasl-xoauth2-tool --version` prints the installed version.
+`sasl-xoauth2-tool --version` (or `-v`, `-V`) prints the versions of the tool,
+of its `test-config` helper and of the installed plugin, with their paths, and
+exits with status 1 if they differ or a component is missing -- typically a
+sign of an older installation that is still in use (see [Removing Older
+Installations](#removing-older-installations)):
+
+```
+$ sasl-xoauth2-tool --version
+sasl-xoauth2-tool 0.29 (/usr/bin/sasl-xoauth2-tool)
+test-config       0.29 (/usr/lib/x86_64-linux-gnu/sasl-xoauth2/test-config)
+plugin            0.29 (/usr/lib/x86_64-linux-gnu/sasl2/libsasl-xoauth2.so)
+configuration     /etc/sasl-xoauth2.conf
+```
+
+Plugins older than 0.29 show up as `unknown (older than 0.29)`. The plugin
+also names its version in every failure message in the mail log.
 
 ### Restart Postfix
 
 ```
-$ service postfix restart
+$ sudo systemctl restart postfix
 ```
 
 ## Using Multiple Mail Providers or Users Simultaneously
@@ -1225,7 +1367,9 @@ than the configuration says.
 - **Ubuntu 26.04:** the `ReadWritePaths=-/etc/tokens` drop-in for Postfix, and
   the check that Postfix can write there; see [A Note on Ubuntu
   26.04](#a-note-on-ubuntu-2604).
-- **Monitoring** of token files and of the mail queue; see
+- **Daily token refresh** (systemd timer or cron); see [Daily Token
+  Refresh](#daily-token-refresh).
+- **Monitoring** of the refresh, the mail log and the mail queue; see
   [Monitoring](#monitoring).
 - For Way B, a **certificate** rather than a client secret, and a reminder for
   its expiry date.
@@ -1261,18 +1405,10 @@ parallel deliveries share a single token request.
 
 ### Monitoring
 
-- **Token files:** run `sasl-xoauth2-tool test-token-refresh` regularly, as the
-  Postfix user, for each token file. Once a day is enough. It exits with 1 for
-  transient and 2 for permanent problems (see [Testing Your
-  Configuration](#testing-your-configuration)). For example, in
-  `/etc/cron.d/sasl-xoauth2`:
-
-  ```
-  17 6 * * * postfix /usr/bin/sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com >/dev/null 2>&1 || logger -p mail.err -t sasl-xoauth2-check "token check for relay@contoso.com failed (exit status $?)"
-  ```
-
-  The check requests a token but does not store it. For Way A, it therefore
-  does not keep an unused refresh token alive (see [A6](#a6-monitoring)).
+- **Token files:** the [daily token refresh](#daily-token-refresh) fails when
+  a token can no longer be obtained or stored; alert on a failed
+  `sasl-xoauth2-refresh.service` (e.g. `systemctl --failed`, or an
+  `OnFailure=` unit that notifies you).
 - **Logs:** alert on `[sasl-xoauth2] auth failed` and on `[sasl-xoauth2]
   unable to update token file` in the mail log. The plugin logs through
   Postfix's syslog connection; if Postfix writes its own log file
@@ -1280,6 +1416,75 @@ parallel deliveries share a single token request.
   (`journalctl`) instead.
 - **Queue:** alert on deferred mail (e.g. `postqueue -j`, or the number of
   files in `/var/spool/postfix/deferred`).
+
+### Daily Token Refresh
+
+`sasl-xoauth2-tool refresh-token` requests a new token for each token file
+given and stores it, under the same lock the plugin uses, even if the current
+token is still valid. Run once a day, it
+
+- keeps refresh tokens alive that expire when unused (Microsoft: after 90
+  days; each refresh issues a new one, which is stored), also when no mail is
+  sent;
+- checks the whole setup under real conditions -- credentials, token
+  endpoint, file permissions -- and fails with exit status 2 (needs action) or
+  1 (transient) and the reason, like `test-token-refresh`.
+
+Token files keep their owner and permissions, also if it runs as root. A
+systemd timer, with the same file system restrictions as Postfix on Ubuntu
+26.04:
+
+```
+# /etc/systemd/system/sasl-xoauth2-refresh.service
+[Unit]
+Description=Refresh sasl-xoauth2 OAuth tokens
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=postfix
+Group=postfix
+ExecStart=/usr/bin/sasl-xoauth2-tool refresh-token /etc/tokens/relay@contoso.com
+ProtectSystem=full
+ReadWritePaths=-/etc/tokens
+PrivateTmp=yes
+NoNewPrivileges=yes
+```
+
+```
+# /etc/systemd/system/sasl-xoauth2-refresh.timer
+[Unit]
+Description=Daily refresh of sasl-xoauth2 OAuth tokens
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+List all token files in `ExecStart` (the exit status is the highest of
+all). Then enable the timer and run the refresh once by hand:
+
+```
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now sasl-xoauth2-refresh.timer
+$ sudo systemctl start sasl-xoauth2-refresh.service
+$ journalctl -u sasl-xoauth2-refresh.service
+... Token refresh succeeded; token file updated.
+```
+
+Alternatively, with cron (e.g. `/etc/cron.d/sasl-xoauth2`):
+
+```
+17 6 * * * postfix /usr/bin/sasl-xoauth2-tool refresh-token /etc/tokens/relay@contoso.com >/dev/null 2>&1 || logger -p mail.err -t sasl-xoauth2-refresh "token refresh failed (exit status $?)"
+```
+
+With a chrooted `smtp` service, use the token file paths below
+`/var/spool/postfix` (and `ReadWritePaths` is not needed).
 
 ### Backups
 
@@ -1301,7 +1506,7 @@ settings in `/etc/sasl-xoauth2.conf`, writes it to syslog, prefixed
 
 | Setting | Default | Effect |
 |---|---|---|
-| `log_to_syslog_on_failure` | `yes` | When authentication fails, log one line with the reason: which token file, which endpoint, the provider's error (e.g. HTTP status and AADSTS code) and a hint. `no` disables all logging on failure. |
+| `log_to_syslog_on_failure` | `yes` | When authentication fails, log one line with the reason: which token file, which endpoint, the provider's error (e.g. HTTP status and AADSTS code) and a hint (followed by a note on how to see the full trace). `no` disables all logging on failure. |
 | `log_full_trace_on_failure` | `no` | When authentication fails, log the whole trace instead of only that line. |
 | `always_log_to_syslog` | `no` | Log every trace line immediately, also for successful authentications. |
 
@@ -1345,5 +1550,5 @@ Postfix's logging level, following the instructions
 
 If Postfix complains about not finding a SASL mechanism (along the lines of
 `warning: SASL authentication failure: No worthy mechs found`), it's possible
-`make install` put libsasl-xoauth2.so in the wrong directory (see the
+`cmake --install` put libsasl-xoauth2.so in the wrong directory (see the
 installation paths under [Building from Source](#building-from-source)).

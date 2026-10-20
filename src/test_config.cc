@@ -21,13 +21,17 @@ constexpr int kExitPermanent = 2;  // e.g. invalid config, rejected token.
 struct Options {
   std::string config_path;
   std::string token_path;
+  bool update = false;
+  bool help = false;
 };
 
 bool TryParseCommandLine(int argc, char **argv, Options *out) {
-  const char *kShortOptions = "c:r:V";
+  const char *kShortOptions = "c:r:uvVh";
   const option kLongOptions[] = {{"config", required_argument, nullptr, 'c'},
                                  {"token", required_argument, nullptr, 'r'},
+                                 {"update", no_argument, nullptr, 'u'},
                                  {"version", no_argument, nullptr, 'V'},
+                                 {"help", no_argument, nullptr, 'h'},
                                  {nullptr, 0, nullptr, 0}};
 
   while (true) {
@@ -43,6 +47,15 @@ bool TryParseCommandLine(int argc, char **argv, Options *out) {
         out->token_path = optarg;
         break;
 
+      case 'u':
+        out->update = true;
+        break;
+
+      case 'h':
+        out->help = true;
+        break;
+
+      case 'v':
       case 'V':
         printf("sasl-xoauth2 %s\n", SASL_XOAUTH2_VERSION);
         exit(kExitOk);
@@ -52,7 +65,7 @@ bool TryParseCommandLine(int argc, char **argv, Options *out) {
     }
   }
 
-  return true;
+  return !out->update || !out->token_path.empty();
 }
 
 void PrintUsage(const std::string &base_name) {
@@ -63,8 +76,13 @@ void PrintUsage(const std::string &base_name) {
           "                       system default\n"
           "  -r, --token=<file>   attempt to request a token from the OAuth\n"
           "                       provider using the token file <file> (which\n"
-          "                       is not modified)\n"
-          "  -V, --version        print the version and exit\n\n"
+          "                       is not modified, unless --update is given)\n"
+          "  -u, --update         with --token: store the new token in the\n"
+          "                       token file (also renews a rotating refresh\n"
+          "                       token, e.g. Microsoft's); for a scheduled\n"
+          "                       daily refresh\n"
+          "  -V, -v, --version    print the version and exit\n"
+          "  -h, --help           print this help and exit\n\n"
           "Exit status: 0 on success, 1 on a transient failure (e.g. network\n"
           "problem or provider outage), 2 on a failure that needs action\n"
           "(e.g. invalid configuration, rejected token, unwritable token\n"
@@ -79,6 +97,10 @@ Options ParseCommandLine(int argc, char **argv) {
   if (!TryParseCommandLine(argc, argv, &parsed_options)) {
     PrintUsage(base_name);
     exit(kExitPermanent);
+  }
+  if (parsed_options.help) {
+    PrintUsage(base_name);
+    exit(kExitOk);
   }
 
   return parsed_options;
@@ -117,7 +139,7 @@ int main(int argc, char **argv) {
         sasl_xoauth2::Log::TARGET_STDERR);
     auto token_store =
         sasl_xoauth2::TokenStore::Create(logger.get(), options.token_path,
-                                         /*enable_updates=*/false);
+                                         /*enable_updates=*/options.update);
     if (!token_store) {
       logger->Flush();
       printf("Failed to read token.\n");
@@ -129,7 +151,16 @@ int main(int argc, char **argv) {
       return token_store->last_error_permanent() ? kExitPermanent
                                                  : kExitTransient;
     }
-    printf("Token refresh succeeded.\n");
+    if (options.update && token_store->last_write_failed()) {
+      logger->Flush();
+      printf(
+          "Token refresh succeeded, but the token file could not be "
+          "updated.\n");
+      CheckTokenDirectoryWritable(options.token_path);
+      return kExitPermanent;
+    }
+    printf(options.update ? "Token refresh succeeded; token file updated.\n"
+                          : "Token refresh succeeded.\n");
     if (!CheckTokenDirectoryWritable(options.token_path)) return kExitPermanent;
   }
 
