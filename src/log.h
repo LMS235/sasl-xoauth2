@@ -29,6 +29,10 @@ void EnableLoggingForTesting();
 // so a trace still shows whether a value was present without revealing it.
 std::string RedactSecret(const std::string &secret);
 
+// Escapes control characters (as \xNN) in values that come from outside, so
+// they cannot forge or split log lines.
+std::string EscapeForLog(const std::string &value);
+
 // Log implementation interface, not for direct use.
 class LogImpl {
  public:
@@ -58,18 +62,22 @@ class Log {
 
   ~Log();
 
-  void Write(const char *fmt, ...);
+  // printf-style; the attribute lets the compiler check arguments (this is a
+  // member function, so argument 1 is the implicit |this|).
+  void Write(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
   void Flush();
   void SetFlushOnDestroy();
 
  protected:
-  Log(std::unique_ptr<LogImpl> impl, Options options)
-      : impl_(std::move(impl)), options_(options) {}
+  Log(std::unique_ptr<LogImpl> impl, Options options, bool discard)
+      : impl_(std::move(impl)), options_(options), discard_(discard) {}
 
  private:
   const std::unique_ptr<LogImpl> impl_;
 
   Options options_;
+  // Nothing would ever be printed (TARGET_NONE), so skip formatting entirely.
+  const bool discard_;
   std::string summary_;
   std::vector<std::string> lines_;
 };

@@ -19,8 +19,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -109,8 +112,61 @@ void SetPasswordToInvalidPath() { s_password = "/tmp/this/path/is/not/valid"; }
 void Cleanup() {
   for (const auto &file : s_cleanup_files) {
     unlink(file.c_str());
+    unlink((file + ".lock").c_str());
   }
 }
+
+// Writes |contents| to a new temporary token file, which becomes s_password.
+void SetPasswordToTokenFile(const std::string &contents) {
+  FILE *f = OpenTempTokenFile();
+  fputs(contents.c_str(), f);
+  fclose(f);
+}
+
+std::string ExpiryIn(int seconds) {
+  return std::to_string(time(nullptr) + seconds);
+}
+
+// A token file with access token "access" and refresh token "r" expiring
+// |seconds| from now, plus |extra| members (each followed by a comma).
+std::string TokenFileExpiringIn(int seconds, const std::string &extra = "") {
+  return R"({"access_token": "access", "refresh_token": "r", )" + extra +
+         R"("expiry": ")" + ExpiryIn(seconds) + R"("})";
+}
+
+std::string ReadFile(const std::string &path) {
+  std::ifstream f(path);
+  std::stringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+Json::Value ReadJsonFile(const std::string &path) {
+  std::ifstream f(path);
+  Json::Value root;
+  f >> root;
+  return root;
+}
+
+// Answers token requests with a fresh access token, recording each request.
+struct FakeTokenEndpoint {
+  int calls = 0;
+  std::string last_request;
+  std::string response =
+      R"({"access_token": "refreshed_access", "expires_in": 3600})";
+  long response_code = 200;
+
+  void Install() {
+    sasl_xoauth2::SetHttpInterceptForTesting(
+        [this](sasl_xoauth2::HttpPostOptions options) {
+          calls++;
+          last_request = options.data;
+          *options.response = response;
+          *options.response_code = response_code;
+          return SASL_OK;
+        });
+  }
+};
 
 int DefaultHttpIntercept(sasl_xoauth2::HttpPostOptions options) {
   fprintf(stderr, "TEST: default http intercept for url=%s\n",
@@ -482,8 +538,9 @@ bool TestWithCallbacksAndOtherOverrides(sasl_client_plug_t plug) {
   fprintf(stderr, "intercept_token_endpoint=[%s], intercept_req_data=[%s]\n",
           intercept_token_endpoint.c_str(), intercept_req_data.c_str());
   TEST_ASSERT(intercept_token_endpoint == kTokenEndpointOverride);
-  TEST_ASSERT(intercept_req_data.find("client_secret=" + kClientSecretOverride +
-                                      "&") != std::string::npos);
+  // The empty override wins over the config's secret, and an empty secret is
+  // not sent at all (public clients must not send one).
+  TEST_ASSERT(intercept_req_data.find("client_secret") == std::string::npos);
 
   TEST_ASSERT_OK(plug.mech_step(context, &params, "", 0, nullptr, &to_server,
                                 &to_server_len, &out_params));
@@ -668,6 +725,14 @@ bool TestFailedPreemptiveTokenRefresh(sasl_client_plug_t plug) {
   return true;
 }
 
+bool TestEscapeForLog() {
+  PrintTestName(__func__);
+  TEST_ASSERT(sasl_xoauth2::EscapeForLog("user@example.com") ==
+              "user@example.com");
+  TEST_ASSERT(sasl_xoauth2::EscapeForLog("a\nb\1c\\") == "a\\x0ab\\x01c\\x5c");
+  return true;
+}
+
 bool TestRedactSecret() {
   PrintTestName(__func__);
   TEST_ASSERT(sasl_xoauth2::RedactSecret("") == "<empty>");
@@ -677,9 +742,341 @@ bool TestRedactSecret() {
   return true;
 }
 
+bool TestFormUrlEncode() {
+  PrintTestName(__func__);
+  TEST_ASSERT(sasl_xoauth2::FormUrlEncode("") == "");
+  TEST_ASSERT(sasl_xoauth2::FormUrlEncode("AZaz09-._~") == "AZaz09-._~");
+  TEST_ASSERT(sasl_xoauth2::FormUrlEncode("a+b&c=d/e f") ==
+              "a%2Bb%26c%3Dd%2Fe%20f");
+  TEST_ASSERT(sasl_xoauth2::FormUrlEncode("\xff\x01") == "%FF%01");
+  return true;
+}
+
+// The configured refresh_window (default 300s) applies: a token with 120s
+// left is refreshed before use.
+bool TestRefreshWindowFromConfig() {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(TokenFileExpiringIn(120));
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  TEST_ASSERT(endpoint.calls == 1);
+  TEST_ASSERT(token == "refreshed_access");
+  // Nothing (in particular no refresh_window) is added to the token file.
+  TEST_ASSERT(!ReadJsonFile(s_password).isMember("refresh_window"));
+  return true;
+}
+
+// Older versions wrote "refresh_window": "0" into every token file; that must
+// not override the configured window, and is dropped on the next write.
+bool TestLegacyZeroRefreshWindowIgnored() {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(TokenFileExpiringIn(120, R"("refresh_window": "0",)"));
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  TEST_ASSERT(endpoint.calls == 1);
+  TEST_ASSERT(!ReadJsonFile(s_password).isMember("refresh_window"));
+  return true;
+}
+
+bool TestRefreshWindowOverrideInTokenFile() {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(
+      TokenFileExpiringIn(120, R"("refresh_window": "30",)"));
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  TEST_ASSERT(endpoint.calls == 0);
+  TEST_ASSERT(token == "access");
+  return true;
+}
+
+bool CheckModeKeptAcrossRefresh(mode_t initial_mode, mode_t expected_mode) {
+  SetPasswordToExpiredToken();
+  TEST_ASSERT(chmod(s_password.c_str(), initial_mode) == 0);
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  const mode_t old_umask = umask(022);
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  const int err = store->Refresh();
+  umask(old_umask);
+  TEST_ASSERT_OK(err);
+
+  struct stat st = {};
+  TEST_ASSERT(stat(s_password.c_str(), &st) == 0);
+  fprintf(stderr, "mode: initial=%o, after refresh=%o\n", initial_mode,
+          st.st_mode & 07777);
+  TEST_ASSERT((st.st_mode & 07777) == expected_mode);
+  TEST_ASSERT(ReadJsonFile(s_password)["access_token"].asString() ==
+              "refreshed_access");
+  return true;
+}
+
+// The token file holds secrets: an update must not widen its permissions.
+bool TestTokenFilePermissionsKept() {
+  PrintTestName(__func__);
+  TEST_ASSERT(CheckModeKeptAcrossRefresh(0600, 0600));
+  TEST_ASSERT(CheckModeKeptAcrossRefresh(0640, 0640));
+  // World access is never carried over.
+  TEST_ASSERT(CheckModeKeptAcrossRefresh(0644, 0640));
+  return true;
+}
+
+bool TestRequestIsFormEncoded() {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(R"({"access_token": "a", "expiry": "0",
+                             "refresh_token": "0.AX+y/z=",
+                             "client_secret": "s~e+c&r=e/t",
+                             "scope": "offline_access https://outlook.office.com/SMTP.Send"})");
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT_OK(store->Refresh());
+  fprintf(stderr, "request=[%s]\n", endpoint.last_request.c_str());
+  // The scope is only sent for client credentials; refresh token requests
+  // get the originally granted scopes (older tools put Google's "scope" into
+  // token files).
+  TEST_ASSERT(endpoint.last_request ==
+              "grant_type=refresh_token&client_id=dummy%20client%20id"
+              "&client_secret=s~e%2Bc%26r%3De%2Ft"
+              "&refresh_token=0.AX%2By%2Fz%3D");
+  return true;
+}
+
+bool TestRotatedRefreshTokenStored() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  FakeTokenEndpoint endpoint;
+  endpoint.response = R"({"access_token": "new_access", "expires_in": 3599,
+                          "refresh_token": "new_refresh"})";
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  const Json::Value root = ReadJsonFile(s_password);
+  TEST_ASSERT(root["refresh_token"].asString() == "new_refresh");
+  TEST_ASSERT(root["access_token"].asString() == "new_access");
+  const long long expiry = std::stoll(root["expiry"].asString());
+  TEST_ASSERT(expiry > time(nullptr) + 3500);
+  return true;
+}
+
+// Microsoft's app-only flow: no refresh token, a .default scope, and the
+// mailbox given as user.
+bool TestClientCredentialsGrant(sasl_client_plug_t plug) {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(R"({"grant_type": "client_credentials",
+                             "scope": "https://outlook.office365.com/.default",
+                             "client_secret": "secret",
+                             "user": "mailbox@contoso.com"})");
+  FakeTokenEndpoint endpoint;
+  endpoint.response =
+      R"({"token_type": "Bearer", "expires_in": 3599, "ext_expires_in": 3599,
+          "access_token": "app_only_access"})";
+  endpoint.Install();
+
+  sasl_utils_t utils = {};
+  utils.free = &FakeFree;
+  utils.getcallback = &FakeGetCallbackAll;
+  utils.malloc = &FakeMalloc;
+
+  void *context = nullptr;
+  TEST_ASSERT_OK(plug.mech_new(nullptr, nullptr, &context));
+  PlugCleanup _(&utils, plug, context);
+
+  sasl_client_params_t params = {};
+  params.utils = &utils;
+  params.canon_user = &FakeCanonUser;
+
+  const char *to_server = nullptr;
+  unsigned int to_server_len = 0;
+  sasl_out_params_t out_params = {};
+
+  TEST_ASSERT_OK(plug.mech_step(context, &params, nullptr, 0, nullptr,
+                                &to_server, &to_server_len, &out_params));
+  const std::string response(to_server, to_server_len);
+  TEST_ASSERT(response ==
+              "user=mailbox@contoso.com\1auth=Bearer app_only_access\1\1");
+
+  fprintf(stderr, "request=[%s]\n", endpoint.last_request.c_str());
+  TEST_ASSERT(endpoint.calls == 1);
+  TEST_ASSERT(endpoint.last_request ==
+              "grant_type=client_credentials&client_id=dummy%20client%20id"
+              "&client_secret=secret"
+              "&scope=https%3A%2F%2Foutlook.office365.com%2F.default");
+
+  const Json::Value root = ReadJsonFile(s_password);
+  TEST_ASSERT(!root.isMember("refresh_token"));
+  TEST_ASSERT(root["grant_type"].asString() == "client_credentials");
+  TEST_ASSERT(root["access_token"].asString() == "app_only_access");
+  return true;
+}
+
+bool TestClientCredentialsWithoutScopeFails() {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(R"({"grant_type": "client_credentials"})");
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT(store->GetAccessToken(&token) != SASL_OK);
+  TEST_ASSERT(endpoint.calls == 0);
+  return true;
+}
+
+bool TestInvalidTokenFilesRejected() {
+  PrintTestName(__func__);
+  auto log = sasl_xoauth2::Log::Create();
+
+  SetPasswordToTokenFile(R"({"grant_type": "password", "refresh_token": "r"})");
+  TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
+
+  // A refresh_token grant needs a refresh token.
+  SetPasswordToTokenFile(R"({"access_token": "a"})");
+  TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
+
+  SetPasswordToTokenFile(R"(["not", "an", "object"])");
+  TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
+
+  SetPasswordToTokenFile(R"({"refresh_token": "r", "refresh_window": "-1"})");
+  TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
+
+  // A window as long as the token lifetime would refresh on every connection.
+  SetPasswordToTokenFile(R"({"refresh_token": "r", "refresh_window": "3600"})");
+  TEST_ASSERT(!sasl_xoauth2::TokenStore::Create(log.get(), s_password));
+  return true;
+}
+
+// Another process refreshed (and rewrote) the token file after this one read
+// it: this one picks up that token instead of requesting another.
+bool TestUsesTokenRefreshedByOtherProcess() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+
+  {
+    std::ofstream f(s_password);
+    f << R"({"access_token": "from_other_process", "refresh_token": "r2",
+             "expiry": ")"
+      << ExpiryIn(3600) << R"("})";
+  }
+
+  std::string token;
+  TEST_ASSERT_OK(store->GetAccessToken(&token));
+  TEST_ASSERT(token == "from_other_process");
+  TEST_ASSERT(endpoint.calls == 0);
+  return true;
+}
+
+bool TestMaxRefreshAttempts() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  int calls = 0;
+  sasl_xoauth2::SetHttpInterceptForTesting(
+      [&calls](sasl_xoauth2::HttpPostOptions options) {
+        calls++;
+        *options.response = R"({"access_token": "access)" +
+                            std::to_string(calls) + R"(", "expires_in": 3600})";
+        *options.response_code = 200;
+        return SASL_OK;
+      });
+
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT_OK(store->Refresh());
+  TEST_ASSERT_OK(store->Refresh());
+  TEST_ASSERT(store->Refresh() != SASL_OK);
+  TEST_ASSERT(calls == 2);
+  return true;
+}
+
+bool TestErrorResponse() {
+  PrintTestName(__func__);
+  SetPasswordToExpiredToken();
+  FakeTokenEndpoint endpoint;
+  endpoint.response_code = 400;
+  endpoint.response =
+      R"({"error": "invalid_grant", "error_description": "AADSTS70000: The provided value for the 'refresh_token' is not valid.", "error_codes": [70000]})";
+  endpoint.Install();
+
+  const std::string before = ReadFile(s_password);
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  std::string token;
+  TEST_ASSERT(store->GetAccessToken(&token) == SASL_BADPROT);
+  // A failed refresh leaves the token file alone.
+  TEST_ASSERT(ReadFile(s_password) == before);
+  return true;
+}
+
+bool TestControlCharacterInUserRejected(sasl_client_plug_t plug) {
+  PrintTestName(__func__);
+  SetPasswordToTokenFile(
+      TokenFileExpiringIn(3600, R"("user": "evil\u0001auth=Bearer x",)"));
+  sasl_xoauth2::SetHttpInterceptForTesting(&DefaultHttpIntercept);
+
+  sasl_utils_t utils = {};
+  utils.free = &FakeFree;
+  utils.getcallback = &FakeGetCallbackAll;
+  utils.malloc = &FakeMalloc;
+
+  void *context = nullptr;
+  TEST_ASSERT_OK(plug.mech_new(nullptr, nullptr, &context));
+  PlugCleanup _(&utils, plug, context);
+
+  sasl_client_params_t params = {};
+  params.utils = &utils;
+  params.canon_user = &FakeCanonUser;
+
+  const char *to_server = nullptr;
+  unsigned int to_server_len = 0;
+  sasl_out_params_t out_params = {};
+
+  TEST_ASSERT(plug.mech_step(context, &params, nullptr, 0, nullptr, &to_server,
+                             &to_server_len, &out_params) != SASL_OK);
+  TEST_ASSERT(to_server_len == 0);
+  return true;
+}
+
 int main(int argc, char **argv) {
   sasl_xoauth2::EnableLoggingForTesting();
   TEST_ABORT(TestRedactSecret());
+  TEST_ABORT(TestEscapeForLog());
 
   Json::Value config;
   config["client_id"] = "dummy client id";
@@ -716,6 +1113,20 @@ int main(int argc, char **argv) {
   TEST_ABORT(TestWithTokenExpiredError(plug));
   TEST_ABORT(TestPreemptiveTokenRefresh(plug));
   TEST_ABORT(TestFailedPreemptiveTokenRefresh(plug));
+  TEST_ABORT(TestFormUrlEncode());
+  TEST_ABORT(TestRefreshWindowFromConfig());
+  TEST_ABORT(TestLegacyZeroRefreshWindowIgnored());
+  TEST_ABORT(TestRefreshWindowOverrideInTokenFile());
+  TEST_ABORT(TestTokenFilePermissionsKept());
+  TEST_ABORT(TestRequestIsFormEncoded());
+  TEST_ABORT(TestRotatedRefreshTokenStored());
+  TEST_ABORT(TestClientCredentialsGrant(plug));
+  TEST_ABORT(TestClientCredentialsWithoutScopeFails());
+  TEST_ABORT(TestInvalidTokenFilesRejected());
+  TEST_ABORT(TestUsesTokenRefreshedByOtherProcess());
+  TEST_ABORT(TestMaxRefreshAttempts());
+  TEST_ABORT(TestErrorResponse());
+  TEST_ABORT(TestControlCharacterInUserRejected(plug));
 
   Cleanup();
   fprintf(stderr, "\nALL TESTS PASS.\n");

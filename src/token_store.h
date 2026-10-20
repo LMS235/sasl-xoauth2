@@ -41,8 +41,18 @@ class TokenStore {
  private:
   TokenStore(Log *log, const std::string &path, bool enable_updates);
 
+  // Reads the token file. Either everything is read, or (on failure) nothing in
+  // the store changes.
   int Read();
   int Write();
+
+  int RefreshWindow() const;
+  std::string GrantType() const;
+  bool NeedsRefresh() const;
+
+  // With the refresh lock held: re-reads the token file and returns true if
+  // another process has meanwhile stored a fresh access token.
+  bool ReloadIfRefreshedElsewhere();
 
   Log *const log_ = nullptr;
   const std::string path_;
@@ -55,7 +65,9 @@ class TokenStore {
   std::optional<std::string> override_proxy_;
   std::optional<std::string> override_ca_bundle_file_;
   std::optional<std::string> override_ca_certs_dir_;
-  std::optional<int> override_refresh_window_ = 0;
+  std::optional<std::string> override_grant_type_;
+  std::optional<std::string> override_scope_;
+  std::optional<int> override_refresh_window_;
 
   std::string access_;
   std::string refresh_;

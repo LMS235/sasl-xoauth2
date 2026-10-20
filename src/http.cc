@@ -18,8 +18,9 @@
 #include <sasl/sasl.h>
 #include <string.h>
 
+#include <algorithm>
 #include <memory>
-#include <vector>
+#include <string>
 
 namespace sasl_xoauth2 {
 
@@ -31,6 +32,14 @@ struct CURLDeleter final {
 using UniqueCURL = std::unique_ptr<CURL, CURLDeleter>;
 
 constexpr char kUserAgent[] = "sasl xoauth2 token refresher";
+
+// A token request runs inside the mail agent's delivery process, so it must
+// never block indefinitely on an unresponsive endpoint or proxy.
+constexpr long kConnectTimeoutSec = 10;
+constexpr long kTotalTimeoutSec = 30;
+
+// Token responses are a few KB at most; anything far larger is not one.
+constexpr size_t kMaxResponseBytes = 256 * 1024;
 
 class RequestContext {
  public:
@@ -50,9 +59,11 @@ class RequestContext {
     size *= items;
 
     auto *request = static_cast<RequestContext *>(context);
-    size_t old_size = request->from_server_.size();
-    request->from_server_.resize(old_size + size);
-    memcpy(&request->from_server_[old_size], data, size);
+    if (request->from_server_.size() + size > kMaxResponseBytes) {
+      request->response_too_large_ = true;
+      return 0;  // Makes curl abort the transfer with CURLE_WRITE_ERROR.
+    }
+    request->from_server_.append(data, size);
 
     return size;
   }
@@ -68,9 +79,8 @@ class RequestContext {
 
   size_t to_server_size() const { return to_server_.size(); }
 
-  std::string from_server() const {
-    return std::string(from_server_.begin(), from_server_.end());
-  }
+  std::string *mutable_from_server() { return &from_server_; }
+  bool response_too_large() const { return response_too_large_; }
 
  private:
   void Rewind() {
@@ -82,12 +92,33 @@ class RequestContext {
   const char *to_server_next_ = nullptr;
   size_t to_server_remaining_ = 0;
 
-  std::vector<char> from_server_;
+  std::string from_server_;
+  bool response_too_large_ = false;
 };
 
 HttpIntercept s_intercept = {};
 
 }  // namespace
+
+std::string FormUrlEncode(const std::string &value) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(value.size() * 3);
+  for (const unsigned char c : value) {
+    // Explicit ranges rather than isalnum(), which depends on the locale.
+    const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                            c == '_' || c == '~';
+    if (unreserved) {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[c >> 4]);
+      out.push_back(kHex[c & 0x0f]);
+    }
+  }
+  return out;
+}
 
 void SetHttpInterceptForTesting(HttpIntercept intercept) {
   s_intercept = intercept;
@@ -119,6 +150,17 @@ int HttpPost(HttpPostOptions options) {
 
   // Network.
   curl_easy_setopt(curl.get(), CURLOPT_URL, options.url.c_str());
+  curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+  curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, kTotalTimeoutSec);
+
+  // The request carries the client secret and refresh token: only ever send it
+  // over HTTPS (this does not restrict the scheme used to reach a proxy).
+#if LIBCURL_VERSION_NUM >= 0x075500  // 7.85.0
+  curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "https");
+#else
+  curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
+  curl_easy_setopt(curl.get(), CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
 
   // Certs.
   if (options.ca_certs_dir.empty()) {
@@ -131,8 +173,9 @@ int HttpPost(HttpPostOptions options) {
     curl_easy_setopt(curl.get(), CURLOPT_CAPATH, options.ca_certs_dir.c_str());
   }
 
-  // HTTP.
-  curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, true);
+  // HTTP. Token endpoints do not redirect; following a redirect could resend
+  // the credentials (on 307/308) to wherever it points.
+  curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, false);
   curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, kUserAgent);
   if (!options.proxy.empty())
     curl_easy_setopt(curl.get(), CURLOPT_PROXY, options.proxy.c_str());
@@ -150,6 +193,12 @@ int HttpPost(HttpPostOptions options) {
 
   CURLcode err = curl_easy_perform(curl.get());
 
+  if (context.response_too_large()) {
+    *options.error =
+        "Response exceeds " + std::to_string(kMaxResponseBytes) + " bytes.";
+    return SASL_BADPROT;
+  }
+
   if (err != CURLE_OK) {
     *options.error = transport_error;
     if (options.error->empty()) {
@@ -160,7 +209,7 @@ int HttpPost(HttpPostOptions options) {
   }
 
   curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, options.response_code);
-  *options.response = context.from_server();
+  options.response->swap(*context.mutable_from_server());
   return SASL_OK;
 }
 

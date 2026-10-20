@@ -23,6 +23,14 @@
 
 namespace sasl_xoauth2 {
 
+// OAuth 2 grant types supported for obtaining access tokens.
+constexpr char kGrantTypeRefreshToken[] = "refresh_token";
+constexpr char kGrantTypeClientCredentials[] = "client_credentials";
+
+// Access tokens from Google and Microsoft live about an hour; a refresh window
+// close to that would request a new token for every connection.
+constexpr int kMaxRefreshWindow = 1800;  // seconds
+
 class Config {
  public:
   static void EnableLoggingToStderr();
@@ -32,16 +40,21 @@ class Config {
 
   static Config *Get();
 
-  std::string client_id() const { return client_id_; }
-  std::string client_secret() const { return client_secret_; }
+  const std::string &client_id() const { return client_id_; }
+  const std::string &client_secret() const { return client_secret_; }
   bool always_log_to_syslog() const { return always_log_to_syslog_; }
   bool log_to_syslog_on_failure() const { return log_to_syslog_on_failure_; }
   bool log_full_trace_on_failure() const { return log_full_trace_on_failure_; }
-  std::string token_endpoint() const { return token_endpoint_; }
-  std::string proxy() const { return proxy_; }
-  std::string ca_bundle_file() const { return ca_bundle_file_; }
-  std::string ca_certs_dir() const { return ca_certs_dir_; }
+  const std::string &token_endpoint() const { return token_endpoint_; }
+  const std::string &proxy() const { return proxy_; }
+  const std::string &ca_bundle_file() const { return ca_bundle_file_; }
+  const std::string &ca_certs_dir() const { return ca_certs_dir_; }
   int refresh_window() const { return refresh_window_; }
+  const std::string &grant_type() const { return grant_type_; }
+  const std::string &scope() const { return scope_; }
+
+  static bool IsValidGrantType(const std::string &grant_type);
+  static bool IsValidRefreshWindow(int refresh_window);
 
  private:
   Config() = default;
@@ -57,7 +70,12 @@ class Config {
   std::string proxy_ = "";
   std::string ca_bundle_file_ = "";
   std::string ca_certs_dir_ = "";
-  int refresh_window_ = 10;  // seconds
+  // Refresh this many seconds before the access token expires, so that a token
+  // never runs out while a message is being submitted (Microsoft rejects
+  // tokens that are about to expire).
+  int refresh_window_ = 300;  // seconds
+  std::string grant_type_ = kGrantTypeRefreshToken;
+  std::string scope_ = "";
 };
 
 }  // namespace sasl_xoauth2

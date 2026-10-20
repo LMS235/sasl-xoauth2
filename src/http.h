@@ -36,6 +36,11 @@ struct HttpPostOptions {
 
 using HttpIntercept = std::function<int(HttpPostOptions)>;
 
+// Percent-encodes |value| for use as a key or value in an
+// application/x-www-form-urlencoded body. Everything but RFC 3986 unreserved
+// characters is escaped, so secrets containing '+', '&', '=' or '/' survive.
+std::string FormUrlEncode(const std::string &value);
+
 void SetHttpInterceptForTesting(HttpIntercept intercept);
 
 int HttpPost(HttpPostOptions options);

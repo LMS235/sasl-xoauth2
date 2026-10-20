@@ -72,9 +72,11 @@ install(
   DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}
   COMPONENT config)
 
-add_executable(${PROJECT_NAME}_test xoauth2_test.cc)
-target_link_libraries(${PROJECT_NAME}_test ${PROJECT_NAME})
+if(EnableTests)
+  add_executable(${PROJECT_NAME}_test xoauth2_test.cc)
+  target_link_libraries(${PROJECT_NAME}_test ${PROJECT_NAME})
 
-add_test(
-  NAME ${PROJECT_NAME}_test
-  COMMAND ${PROJECT_NAME}_test)
+  add_test(
+    NAME ${PROJECT_NAME}_test
+    COMMAND ${PROJECT_NAME}_test)
+endif()

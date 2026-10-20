@@ -87,6 +87,21 @@ std::string RedactSecret(const std::string &secret) {
   return "<redacted, " + std::to_string(secret.size()) + " bytes>";
 }
 
+std::string EscapeForLog(const std::string &value) {
+  std::string out;
+  out.reserve(value.size());
+  for (const unsigned char c : value) {
+    if (c < 0x20 || c == 0x7f || c == '\\') {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "\\x%02x", c);
+      out += buf;
+    } else {
+      out.push_back(static_cast<char>(c));
+    }
+  }
+  return out;
+}
+
 void EnableLoggingForTesting() {
   s_default_options = Log::OPTIONS_IMMEDIATE;
   s_default_target = Log::TARGET_STDERR;
@@ -95,7 +110,8 @@ void EnableLoggingForTesting() {
 std::unique_ptr<Log> Log::Create(Options options, Target target) {
   options = static_cast<Options>(options | s_default_options);
   if (target == TARGET_DEFAULT) target = s_default_target;
-  return std::unique_ptr<Log>(new Log(CreateLogImpl(target), options));
+  return std::unique_ptr<Log>(
+      new Log(CreateLogImpl(target), options, target == TARGET_NONE));
 }
 
 Log::~Log() {
@@ -103,19 +119,22 @@ Log::~Log() {
 }
 
 void Log::Write(const char *fmt, ...) {
+  if (discard_) return;
+
   va_list args;
 
   va_start(args, fmt);
   int buf_len = vsnprintf(nullptr, 0, fmt, args);
   va_end(args);
+  if (buf_len < 0) return;
 
-  // +1 for the trailing \0.
+  // +1 for the trailing \0, which is not part of the line.
   std::vector<char> buf(buf_len + 1);
   va_start(args, fmt);
   vsnprintf(buf.data(), buf.size(), fmt, args);
   va_end(args);
 
-  const std::string line(buf.begin(), buf.end());
+  const std::string line(buf.data(), buf_len);
   if (options_ & OPTIONS_IMMEDIATE) {
     impl_->WriteLine(line);
   } else {
