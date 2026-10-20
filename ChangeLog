@@ -29,6 +29,9 @@ sasl-xoauth2 (0.29) unstable; urgency=medium
   * CA certificate script removes certificates no longer present on the
     system, copies symlink targets and skips dangling symlinks.
   * Never terminate the host process from within the plugin.
+  * -DEnableTests=OFF no longer builds the test program.
+  * README: build instructions for Ubuntu 26.04 LTS; both Microsoft 365
+    ways (delegated, app-only) described side by side.
 
  -- Florian Lamml <florian.lamml@contis.de>  Tue, 20 Oct 2026 15:00:00 +0200
 

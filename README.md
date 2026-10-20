@@ -82,21 +82,25 @@ Plugin "sasl-xoauth2" [loaded],         API version: 4
         SASL mechanism: XOAUTH2, best SSF: 60
 ```
 
-Postfix runs its `smtp` client in a chroot by default; copy the CA
-certificates into it, and install the script that keeps them up to date as an
-`update-ca-certificates` hook (see [SSL/TLS
-Certificates](#ssltls-certificates)):
+On Ubuntu 26.04, Postfix's `smtp` service does not run chrooted by default
+(see [A Note on chroot](#a-note-on-chroot)), but its systemd sandbox needs one
+adjustment so that token files can be updated: see [A Note on Ubuntu
+26.04](#a-note-on-ubuntu-2604).
+
+Only if you enable the chroot: copy the CA certificates into it, and install
+the script that keeps them up to date as an `update-ca-certificates` hook (see
+[SSL/TLS Certificates](#ssltls-certificates)):
 
 ```
 $ sudo install -m 755 scripts/postfix-sasl-xoauth2-update-ca-certs /etc/ca-certificates/update.d/
 $ sudo /etc/ca-certificates/update.d/postfix-sasl-xoauth2-update-ca-certs
 ```
 
-Also see [A Note on Ubuntu 26.04](#a-note-on-ubuntu-2604) for Postfix's
-systemd sandboxing. Continue with [Configuration](#configuration).
+Continue with [Configuration](#configuration).
 
 To build without the test program, add `-DEnableTests=OFF` to the first
-`cmake` command. To uninstall, remove the files listed above.
+`cmake` command (and skip `ctest`). To uninstall, remove the files listed
+above.
 
 ### Other Distributions
 
@@ -152,8 +156,8 @@ check your SELinux audit logs.
 ### A Note on Ubuntu 26.04
 
 Postfix's systemd unit on Ubuntu 26.04 sets `ProtectSystem=full`, which makes
-`/etc` read-only for Postfix. If the token files are outside the chroot (e.g.
-`/etc/tokens`, when the `smtp` service does not run chrooted), sasl-xoauth2
+`/etc` read-only for Postfix. With token files in `/etc/tokens` -- the normal
+case, since the `smtp` service does not run chrooted by default -- sasl-xoauth2
 then cannot update them, and fails with errors about a read-only file system.
 Rather than relaxing the sandbox as a whole, allow writes to just the token
 directory (thank you @bernd-it for pointing out the problem):
@@ -169,8 +173,9 @@ And then add:
 ReadWritePaths=/etc/tokens
 ```
 
-(For instances started via `postfix@.service`, edit that unit instead.) Token
-files inside the chroot (`/var/spool/postfix/etc/tokens`) are not affected.
+Then `sudo systemctl restart postfix`. (For instances started via
+`postfix@.service`, edit that unit instead.) Token files inside the chroot
+(`/var/spool/postfix/etc/tokens`) are not affected.
 
 ## Configuration
 
@@ -267,6 +272,10 @@ runtime relative to the Postfix root (`/var/spool/postfix`, usually).
 This means that **even though the path in `/etc/postfix/sasl_passwd` is
 (and should be) `/etc/tokens/username@domain.com`**, at runtime Postfix will
 attempt to read from `/var/spool/postfix/etc/tokens/username@domain.com`.
+
+Whether chroot is enabled by default depends on the distribution and its
+version; on Ubuntu 26.04, for example, the `smtp` service is *not* chrooted
+(`n` in the chroot column), so the token path is used as is.
 
 #### A Note on Token File Permissions
 
@@ -461,11 +470,17 @@ relayhost = [smtp.office365.com]:587
 ```
 
 and, in `/etc/postfix/sasl_passwd`, the mailbox that sends the mail and the
-path of its token file (see [A Note on chroot](#a-note-on-chroot)):
+path of its token file:
 
 ```
 [smtp.office365.com]:587 relay@contoso.com:/etc/tokens/relay@contoso.com
 ```
+
+The examples below use `/etc/tokens`, which is where the token files are when
+Postfix's `smtp` service is not chrooted (the default on Ubuntu 26.04). If it is chrooted, the token files must be in
+`/var/spool/postfix/etc/tokens` instead (see [A Note on
+chroot](#a-note-on-chroot)). On Ubuntu 26.04, Postfix must also be allowed to
+write to `/etc/tokens` (see [A Note on Ubuntu 26.04](#a-note-on-ubuntu-2604)).
 
 SMTP AUTH must be enabled for the mailbox. It is often disabled for the whole
 organization (`Get-TransportConfig | Format-List SmtpClientAuthenticationDisabled`);
@@ -577,13 +592,13 @@ is the path from `sasl_passwd` -- with chroot, below `/var/spool/postfix` (see
 
 ```shell
 $ sasl-xoauth2-tool get-token outlook \
-    /var/spool/postfix/etc/tokens/relay@contoso.com \
+    /etc/tokens/relay@contoso.com \
     --client-id=APPLICATION_ID \
     --tenant=TENANT_ID \
     --use-device-flow
 To sign in, use a web browser to open the page https://www.microsoft.com/link and enter the code REDACTED to authenticate.
 Acquired token.
-Wrote token to /var/spool/postfix/etc/tokens/relay@contoso.com.
+Wrote token to /etc/tokens/relay@contoso.com.
 ```
 
 Open the page in any browser (it does not have to be on this host), enter the
@@ -595,15 +610,15 @@ Then give the token file to the Postfix user (see [A Note on Token File
 Permissions](#a-note-on-token-file-permissions)):
 
 ```
-$ sudo chown -R postfix:postfix /var/spool/postfix/etc/tokens
-$ sudo chmod 700 /var/spool/postfix/etc/tokens
-$ sudo chmod 600 /var/spool/postfix/etc/tokens/*
+$ sudo chown -R postfix:postfix /etc/tokens
+$ sudo chmod 700 /etc/tokens
+$ sudo chmod 600 /etc/tokens/*
 ```
 
 ##### A4. Test
 
 ```
-$ sasl-xoauth2-tool test-token-refresh /var/spool/postfix/etc/tokens/relay@contoso.com
+$ sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
 Config check passed.
 Token refresh succeeded.
 ```
@@ -622,7 +637,7 @@ token file (such as `user` or `token_endpoint`):
 
 ```shell
 $ sasl-xoauth2-tool get-token outlook \
-    /var/spool/postfix/etc/tokens/relay@contoso.com \
+    /etc/tokens/relay@contoso.com \
     --client-id=APPLICATION_ID \
     --tenant=TENANT_ID \
     --use-device-flow \
@@ -657,7 +672,7 @@ Then run the tool without `--use-device-flow`:
 
 ```shell
 $ sasl-xoauth2-tool get-token outlook \
-    /var/spool/postfix/etc/tokens/relay@contoso.com \
+    /etc/tokens/relay@contoso.com \
     --client-id=APPLICATION_ID \
     --tenant=TENANT_ID
 Please enter OAuth2 client secret (leave empty for public clients):
@@ -666,7 +681,7 @@ Please visit the following link in a web browser, then paste the resulting URL:
 https://login.microsoftonline.com/TENANT_ID/oauth2/v2.0/authorize?client_id=REDACTED&response_type=code&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient&response_mode=query&scope=offline_access+https%3A%2F%2Foutlook.office.com%2FSMTP.Send&state=REDACTED&code_challenge=REDACTED&code_challenge_method=S256
 
 Resulting URL: https://login.microsoftonline.com/common/oauth2/nativeclient?code=REDACTED&state=REDACTED
-Wrote token to /var/spool/postfix/etc/tokens/relay@contoso.com.
+Wrote token to /etc/tokens/relay@contoso.com.
 ```
 
 After signing in you are redirected to a blank page; copy its URL into the
@@ -739,14 +754,14 @@ token can actually be obtained:
 
 ```shell
 $ sasl-xoauth2-tool get-token outlook \
-    /var/spool/postfix/etc/tokens/relay@contoso.com \
+    /etc/tokens/relay@contoso.com \
     --client-credentials \
     --tenant=TENANT_ID \
     --client-id=APPLICATION_ID \
     --mailbox=relay@contoso.com
 Please enter OAuth2 client secret:
 Acquired app-only token.
-Wrote token to /var/spool/postfix/etc/tokens/relay@contoso.com.
+Wrote token to /etc/tokens/relay@contoso.com.
 ```
 
 (Add `--cloud` for national clouds. The secret can also be passed with
@@ -786,7 +801,7 @@ Give the token file to the Postfix user as in [A3](#a3-obtain-the-initial-token)
 ##### B4. Test and Switch Over
 
 ```
-$ sasl-xoauth2-tool test-token-refresh /var/spool/postfix/etc/tokens/relay@contoso.com
+$ sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
 Config check passed.
 Token refresh succeeded.
 ```
