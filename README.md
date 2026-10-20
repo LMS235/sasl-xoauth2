@@ -71,7 +71,7 @@ SASL library (and thus Postfix) does not look, and the configuration file to
 | File | Purpose |
 |---|---|
 | `/usr/lib/x86_64-linux-gnu/sasl2/libsasl-xoauth2.so` | The SASL plugin |
-| `/etc/sasl-xoauth2.conf` | Configuration file (a template; see [Configuration](#configuration)) |
+| `/etc/sasl-xoauth2.conf` | Configuration file template (see [Configuration](#configuration)); only installed if the file does not exist yet, an existing configuration is never overwritten |
 | `/usr/bin/sasl-xoauth2-tool` | Tool to obtain tokens and test the configuration |
 | `/usr/lib/x86_64-linux-gnu/sasl-xoauth2/test-config` | Helper used by `sasl-xoauth2-tool test-config` and `test-token-refresh` |
 | `/usr/share/man/man5/sasl-xoauth2.conf.5`, `/usr/share/man/man1/sasl-xoauth2-tool.1` | Man pages |
@@ -103,8 +103,63 @@ $ sudo /etc/ca-certificates/update.d/postfix-sasl-xoauth2-update-ca-certs
 Continue with [Configuration](#configuration).
 
 To build without the test program, add `-DEnableTests=OFF` to the first
-`cmake` command (and skip `ctest`). To uninstall, remove the files listed
-above.
+`cmake` command (and skip `ctest`).
+
+### Upgrading and Removing Older Installations
+
+To upgrade, fetch the new sources and repeat the build and install steps above
+(`git pull`, then the `cmake` commands). `/etc/sasl-xoauth2.conf` and the token
+files are kept. Postfix picks up the new plugin when it restarts its `smtp`
+processes (`sudo postfix reload`).
+
+Before the first installation with the paths above, make sure no older copy of
+sasl-xoauth2 is installed elsewhere. In particular, an earlier build installed
+with CMake's default prefix lives below `/usr/local`, and because
+`/usr/local/bin` comes first in `PATH`, its `sasl-xoauth2-tool` (with its own
+`test-config` helper and its own configuration file) would still be used:
+
+```
+$ ls -l /usr/local/bin/sasl-xoauth2-tool /usr/local/lib/sasl2/libsasl-xoauth2.so* \
+    /usr/local/lib/sasl-xoauth2 /usr/local/etc/sasl-xoauth2.conf \
+    /usr/local/share/man/man*/sasl-xoauth2* 2>/dev/null
+$ dpkg -l | grep -i xoauth2
+```
+
+If the configuration in use was `/usr/local/etc/sasl-xoauth2.conf`, copy it to
+`/etc/sasl-xoauth2.conf` first. Then remove the old files (and a distribution
+package, if `dpkg` lists one, with `sudo apt remove sasl-xoauth2`):
+
+```
+$ sudo rm -rf /usr/local/bin/sasl-xoauth2-tool /usr/local/lib/sasl2/libsasl-xoauth2.so* \
+    /usr/local/lib/sasl-xoauth2 /usr/local/etc/sasl-xoauth2.conf \
+    /usr/local/share/man/man*/sasl-xoauth2*
+$ sudo rmdir --ignore-fail-on-non-empty /usr/local/lib/sasl2
+$ hash -r
+```
+
+Only the sasl-xoauth2 plugin is removed from `/usr/local/lib/sasl2`; the
+directory itself is only removed if no other SASL plugins are left in it.
+
+(`hash -r` makes the current shell forget the old location of
+`sasl-xoauth2-tool`.) Then check that the new installation is the one in use:
+
+```
+$ which -a sasl-xoauth2-tool
+/usr/bin/sasl-xoauth2-tool
+/bin/sasl-xoauth2-tool
+$ grep '^TEST_TOOL_PATH' /usr/bin/sasl-xoauth2-tool
+TEST_TOOL_PATH = '/usr/lib/x86_64-linux-gnu/sasl-xoauth2/test-config'
+```
+
+(`/bin` is a link to `/usr/bin` on current systems; no path below `/usr/local`
+may appear.)
+
+To uninstall, remove the files listed in `build/install_manifest.txt`, except
+the configuration file:
+
+```
+$ grep -v '\.conf$' build/install_manifest.txt | sudo xargs -d '\n' rm -v
+```
 
 ### Other Distributions
 

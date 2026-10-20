@@ -67,9 +67,19 @@ install(
   TARGETS test-config
   RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}/${PROJECT_NAME})
 
+# The configuration holds the client ID (and possibly the client secret): only
+# install the template if there is no configuration yet, never overwrite one.
 install(
-  FILES ${CONFIG_FILE}
-  DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}
+  CODE "
+    set(config_path \"\$ENV{DESTDIR}${CONFIG_FILE_FULL_PATH}\")
+    if(EXISTS \"\${config_path}\")
+      message(STATUS \"Keeping existing: \${config_path}\")
+    else()
+      file(INSTALL
+        DESTINATION \"${CMAKE_INSTALL_FULL_SYSCONFDIR}\"
+        TYPE FILE
+        FILES \"${CMAKE_CURRENT_SOURCE_DIR}/${CONFIG_FILE}\")
+    endif()"
   COMPONENT config)
 
 if(EnableTests)
