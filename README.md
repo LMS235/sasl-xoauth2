@@ -165,6 +165,10 @@ touched.
    $ sudo -u postfix sasl-xoauth2-tool test-token-refresh /etc/tokens/relay@contoso.com
    ```
 
+   `--version` must show the new version for the tool, `test-config` and the
+   plugin, and exit without a warning (see [Testing Your
+   Configuration](#testing-your-configuration)).
+
 1. Let Postfix load the new plugin. Running `smtp` processes keep the old one
    until they are replaced; `postfix reload` replaces them once they are done
    with their current delivery:
@@ -1226,7 +1230,22 @@ found:
 | 1 | Transient failure, e.g. the token endpoint could not be reached or answered with HTTP 429 or 5xx. Retry later. |
 | 2 | Failure that needs action, e.g. an invalid configuration, an unreadable token file, a rejected refresh token, secret or certificate, or a token directory the user cannot write to. |
 
-`sasl-xoauth2-tool --version` prints the installed version.
+`sasl-xoauth2-tool --version` (or `-v`, `-V`) prints the versions of the tool,
+of its `test-config` helper and of the installed plugin, with their paths, and
+exits with status 1 if they differ or a component is missing -- typically a
+sign of an older installation that is still in use (see [Removing Older
+Installations](#removing-older-installations)):
+
+```
+$ sasl-xoauth2-tool --version
+sasl-xoauth2-tool 0.29 (/usr/bin/sasl-xoauth2-tool)
+test-config       0.29 (/usr/lib/x86_64-linux-gnu/sasl-xoauth2/test-config)
+plugin            0.29 (/usr/lib/x86_64-linux-gnu/sasl2/libsasl-xoauth2.so)
+configuration     /etc/sasl-xoauth2.conf
+```
+
+Plugins older than 0.29 show up as `unknown (older than 0.29)`. The plugin
+also names its version in every failure message in the mail log.
 
 ### Restart Postfix
 

@@ -25,7 +25,7 @@ struct Options {
 };
 
 bool TryParseCommandLine(int argc, char **argv, Options *out) {
-  const char *kShortOptions = "c:r:uV";
+  const char *kShortOptions = "c:r:uvV";
   const option kLongOptions[] = {{"config", required_argument, nullptr, 'c'},
                                  {"token", required_argument, nullptr, 'r'},
                                  {"update", no_argument, nullptr, 'u'},
@@ -49,6 +49,7 @@ bool TryParseCommandLine(int argc, char **argv, Options *out) {
         out->update = true;
         break;
 
+      case 'v':
       case 'V':
         printf("sasl-xoauth2 %s\n", SASL_XOAUTH2_VERSION);
         exit(kExitOk);
@@ -74,7 +75,7 @@ void PrintUsage(const std::string &base_name) {
           "                       token file (also renews a rotating refresh\n"
           "                       token, e.g. Microsoft's); for a scheduled\n"
           "                       daily refresh\n"
-          "  -V, --version        print the version and exit\n\n"
+          "  -V, -v, --version    print the version and exit\n\n"
           "Exit status: 0 on success, 1 on a transient failure (e.g. network\n"
           "problem or provider outage), 2 on a failure that needs action\n"
           "(e.g. invalid configuration, rejected token, unwritable token\n"

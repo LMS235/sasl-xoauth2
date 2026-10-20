@@ -91,6 +91,11 @@ sasl_client_plug_t s_plugin = {
 
 sasl_client_plug_t s_plugins[] = {s_plugin};
 
+// Lets 'sasl-xoauth2-tool --version' (or 'what'/'strings') tell which version
+// an installed plugin file is.
+__attribute__((used)) const char kVersionMarker[] =
+    "@(#)sasl-xoauth2 " SASL_XOAUTH2_VERSION;
+
 }  // namespace
 
 // The only symbol the plugin exports (everything else is hidden at build
