@@ -246,12 +246,23 @@ upgrading from 0.28 or earlier, in addition to the steps above:
    ```
 
    (With chroot, the token files are below `/var/spool/postfix/etc/tokens`.)
-1. **Require verified TLS** to the relay: change `smtp_tls_security_level =
+1. **Require verified TLS** to the relay (see [Configure Mail
+   Agent](#configure-mail-agent)): change `smtp_tls_security_level =
    encrypt` (or `may`) to `secure`, add `smtp_tls_secure_cert_match =
-   nexthop`, and set `smtp_sasl_security_options` and
-   `smtp_sasl_tls_security_options` to `noanonymous` (see [Configure Mail
-   Agent](#configure-mail-agent)); check the relay with `posttls-finger`
-   before reloading Postfix.
+   nexthop`, **set `smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt`**
+   if it is not set yet (without it, Postfix trusts no certificate authority
+   and defers all mail with `untrusted issuer`), and set
+   `smtp_sasl_security_options` and `smtp_sasl_tls_security_options` to
+   `noanonymous`:
+
+   ```
+   $ sudo postconf -e "smtp_tls_security_level = secure" "smtp_tls_secure_cert_match = nexthop" \
+       "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt" "smtp_tls_loglevel = 1" \
+       "smtp_sasl_security_options = noanonymous" "smtp_sasl_tls_security_options = noanonymous"
+   ```
+
+   Check the relay with `posttls-finger` before reloading Postfix, and the
+   mail log afterwards for `Verified TLS connection established`.
 1. **Ubuntu 26.04:** earlier instructions relaxed Postfix's sandbox with
    `ProtectSystem=true`. In `sudo systemctl edit postfix.service`, remove that
    line and add `ReadWritePaths=-/etc/tokens` instead (add the drop-in if you
@@ -457,7 +468,18 @@ smtp_tls_security_level = secure
 smtp_tls_secure_cert_match = nexthop
 smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
 smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+smtp_tls_loglevel = 1
 ```
+
+`smtp_tls_CAfile` is required: Postfix does not use the system's certificate
+authorities by default, and on Ubuntu 26.04 neither `smtp_tls_CAfile` nor
+`smtp_tls_CApath` is set. Without it, every delivery is deferred with
+`certificate verification failed for smtp.office365.com[...]:587: untrusted
+issuer /C=US/O=DigiCert Inc/...` and `Server certificate not verified`.
+(`smtp_tls_CAfile` is read before Postfix enters a chroot, so it also works
+for a chrooted `smtp` service.) `smtp_tls_loglevel = 1` logs each verified
+connection (`Verified TLS connection established to ...`); at the default
+level 0, Postfix logs only failures.
 
 This is essential. XOAUTH2 sends the access token as a bearer credential:
 whoever obtains it can use it (for Gmail's `https://mail.google.com/` scope,
@@ -479,10 +501,12 @@ smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
 ```
 
 Check the relay's certificate with `posttls-finger`, which ships with
-Postfix:
+Postfix, using the same CA file as `smtp_tls_CAfile` (`posttls-finger` does not
+read Postfix's TLS settings, so also check them with `postconf
+smtp_tls_security_level smtp_tls_CAfile`):
 
 ```
-$ posttls-finger -c -l secure -P /etc/ssl/certs "[smtp.office365.com]:587"
+$ posttls-finger -c -l secure -F /etc/ssl/certs/ca-certificates.crt "[smtp.office365.com]:587"
 ...
 posttls-finger: Verified TLS connection established to smtp.office365.com[...]:587: TLSv1.3 ...
 ```
@@ -1210,6 +1234,7 @@ it, with a hint, when a token request fails (see [Debugging](#debugging)).
 | `535 5.7.3` although the token refresh succeeds | Way B: the service principal is missing or has no mailbox permission (check the Object ID in B2); or the `user` is not the mailbox the permission was granted for. |
 | `554 5.2.252 SendAsDenied` | The sender address is not the mailbox's own and `SendAs` has not been granted. |
 | `501 5.5.127 ... Token will expire soon` | Increase `refresh_window` (HVE needs at least 600). |
+| `certificate verification failed ... untrusted issuer /C=US/O=DigiCert Inc/...` and `status=deferred (Server certificate not verified)` | Postfix has no certificate authorities to verify the relay with: set `smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt` (see [Configure Mail Agent](#configure-mail-agent)) and run `sudo postfix reload` and `sudo postqueue -f`. If it is set, update the system's certificates (`sudo apt install --reinstall ca-certificates && sudo update-ca-certificates`). No token is sent in this case. |
 
 #### Further Reading
 
