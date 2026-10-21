@@ -1,72 +1,94 @@
 sasl-xoauth2 (0.29) unstable; urgency=medium
 
-  * Security: keep token file permissions when updating it (updated token
-    files used to be created according to the umask, i.e. world-readable),
-    write it atomically and durably, and never replace it with a partial file.
-  * Security: URL-encode token request parameters, only send token requests
-    over HTTPS, do not follow redirects, require TLS 1.2, bound response size.
-  * Security: reject user names and tokens containing control characters.
-  * Security (tool): create token files readable by their owner only, bind the
-    Gmail listener to 127.0.0.1, use state and PKCE for authorization codes.
-  * Fix refresh_window from the config file being ignored (and "0" being
-    written into every token file); default refresh window is now 300s,
-    maximum 1800s.
-  * Serialize token refreshes between processes with a lock file, and reuse a
-    token another process has just obtained.
-  * Add timeouts to token requests.
-  * Add grant_type/scope options and support for the client credentials
-    (app-only) flow, e.g. Microsoft 365 with SMTP.SendAsApp; the tool gains
-    --client-credentials and --mailbox.
-  * Do not send an empty client_secret.
-  * Escape control characters in logged values from outside (user names,
-    server challenges).
-  * A config file that fails validation no longer counts as loaded.
-  * Log the provider's error and a hint when a token request fails.
-  * Tool: write to stdout for '-', show Entra ID error details, write real
-    token expiry, no longer request the unneeded openid scope, keep owner and
-    group when overwriting a token file, store only the fields the plugin
-    uses for Gmail, works on Python 3.6 again.
-  * CA certificate script removes certificates no longer present on the
-    system, copies symlink targets and skips dangling symlinks.
-  * Never terminate the host process from within the plugin.
-  * -DEnableTests=OFF no longer builds the test program.
-  * Installing no longer overwrites an existing /etc/sasl-xoauth2.conf.
-  * README: build instructions for Ubuntu 26.04 LTS; both Microsoft 365
-    ways (delegated, app-only) described side by side.
-  * Client credentials can authenticate with a certificate (client
-    assertion, PS256, as specified by Microsoft) instead of a client secret:
-    client_certificate_file/client_private_key_file; tool: --certificate,
-    --private-key. client_secret is optional in the configuration file.
-  * The one-line failure log now names the token file, endpoint, HTTP status,
-    provider error and hint, and the plugin version.
-  * A new token that cannot be stored is used anyway (and an error logged);
-    a still-valid token is used if refreshing fails shortly before expiry.
-  * The configured client_secret is not sent to a token endpoint, proxy or CA
-    configured in a token file; such a file needs its own secret.
-  * Escape and cut provider responses in logs; limit token lifetimes; parse
-    numbers strictly; tolerate an unreadable expiry; setgid directories keep
-    the token file's group.
-  * Build: optimized and hardened by default (RelWithDebInfo,
-    _FORTIFY_SOURCE=3, stack protector, full RELRO), plugin exports only
-    sasl_client_plug_init, configuration installed with mode 0640; requires
-    OpenSSL and CMake 3.13.
-  * test-config/tool: --version; exit status 1 (transient) or 2 (needs
-    action); checks that the token directory is writable; ignores proxy
-    environment variables like Postfix; the tool locks token files while
-    updating them, refuses symlinks, requires https for --login-base, and
-    the Gmail flow no longer serves its authorization URL on localhost.
-  * README: verified TLS (smtp_tls_security_level = secure), production
-    checklist, Postfix settings, monitoring, shared mailboxes.
-  * sasl-xoauth2-tool refresh-token (test-config --update): requests and
-    stores a new token, under the plugin's lock; meant to run daily from a
-    systemd timer or cron, keeping unused refresh tokens alive. Token and
-    lock files keep their owner when written as root.
-  * README: upgrade notes for 0.29, daily token refresh. On Ubuntu 26.04,
-    replace the previously recommended ProtectSystem=true for Postfix with
-    ReadWritePaths=-/etc/tokens (see "Upgrading to 0.29").
-  * sasl-xoauth2-tool --version (-v, -V) shows the versions and paths of
-    the tool, its helper and the installed plugin, and warns about a mix of
-    versions; the help lists the commands and the version.
+  Security:
+  * Keep token file permissions when updating a token file (updated files
+    used to be created according to the umask, usually world-readable);
+    write token files atomically and durably, never leaving a partial file;
+    when written by root, token and lock files keep their owner.
+  * Token requests: URL-encode all parameters, only use HTTPS, do not follow
+    redirects, require TLS 1.2, time out (10s connect, 30s total), limit
+    the response size.
+  * Do not send an empty client_secret. Send scope only for client
+    credentials requests (refresh requests keep the granted scopes).
+  * Do not send the client_secret from the configuration file to a token
+    endpoint, proxy or CA set in a token file; such a file needs its own.
+  * Reject user names and tokens containing control characters; escape
+    control characters and cut long values (e.g. provider responses) in
+    logs; limit token lifetimes; parse numbers strictly.
+  * Hardened build by default (RelWithDebInfo, _FORTIFY_SOURCE=3, stack
+    protector, full RELRO); the plugin exports only sasl_client_plug_init.
+  * The configuration file is installed with mode 0640 and never
+    overwritten by a later installation.
+
+  Reliability:
+  * Fix refresh_window in the configuration file being ignored (and "0"
+    being written into every token file, which is now ignored); default
+    300 seconds, maximum 1800.
+  * Serialize token refreshes between processes with a lock file
+    (<token file>.lock) and reuse a token another process just obtained.
+  * Use a new token even if it cannot be stored (and log an error); keep
+    using a still-valid token if a refresh shortly before expiry fails.
+  * Failures log one line naming the token file, endpoint, HTTP status,
+    provider error (e.g. AADSTS code), a hint, and the plugin version.
+  * Never terminate the mail system's process from within the plugin (no
+    exit(), no exceptions leaving the plugin); a configuration that fails
+    validation is not used.
+  * An unreadable expiry in a token file only causes a refresh; setgid
+    directories keep the token file's group.
+
+  Microsoft 365:
+  * New grant_type and scope options: app-only access with the client
+    credentials flow (e.g. SMTP.SendAsApp), as an alternative to the
+    delegated refresh token flow, which remains the default.
+  * Client credentials can authenticate with a certificate (recommended;
+    client assertion signed with PS256 as specified by Microsoft, options
+    client_certificate_file and client_private_key_file) or a client secret;
+    client_secret is optional in the configuration file. Needs OpenSSL.
+
+  sasl-xoauth2-tool and test-config:
+  * New command refresh-token (test-config --update): requests and stores a
+    new token under the plugin's lock; run daily (systemd timer or cron) to
+    keep unused refresh tokens alive and to check the setup.
+  * get-token outlook: --client-credentials with --certificate/--private-key
+    (checks the setup right away) or a client secret, --mailbox; switching
+    a token file between these and the delegated flow removes settings that
+    no longer apply. No longer requests the unneeded openid scope.
+  * test-token-refresh/refresh-token exit with 1 (transient failure) or 2
+    (needs action), also check that the token directory is writable, and
+    ignore proxy environment variables, as Postfix does.
+  * --version (-v, -V) shows the versions and paths of the tool, its helper
+    and the installed plugin, and warns about a mix of versions; the help
+    shows the version and lists the commands; test-config has -h/--help.
+  * Token files: created readable by their owner only, owner and group kept
+    when overwriting, locked while updating, symlinks refused; '-' writes to
+    stdout; real token expiry; for Gmail, only the fields the plugin uses.
+  * Authorization code flows use state and PKCE; the Gmail listener binds to
+    127.0.0.1 (--local-listen-address) and serves only Google's redirect;
+    --login-base must be https; Entra ID error details are shown; works on
+    Python 3.6 again.
+  * CA certificate script: removes certificates no longer present on the
+    system, copies symlink targets, skips dangling symlinks.
+
+  Build:
+  * Requires OpenSSL (libssl-dev) and CMake 3.13; -DEnableTests=OFF no
+    longer builds the test program.
+
+  Documentation:
+  * README: build, update and upgrade instructions for Ubuntu 26.04 LTS
+    (including removing older installations); both Microsoft 365 ways
+    (delegated, app-only with certificate or secret) side by side; shared
+    mailboxes; verified TLS (smtp_tls_security_level = secure,
+    smtp_tls_CAfile, smtp_tls_loglevel); permissions; on Ubuntu 26.04,
+    ReadWritePaths=-/etc/tokens instead of the previously recommended
+    ProtectSystem=true; running in production (checklist, Postfix
+    settings, daily token refresh, monitoring, backups); searching the
+    logs; troubleshooting table; logging options.
+  * Man page sasl-xoauth2.conf(5): new options, token file keys, value
+    syntax.
+
+  Repository:
+  * Clone URL and man page links point to LMS235/sasl-xoauth2; references
+    to pre-built packages and FUNDING.yml removed; disclaimer extended.
 
  -- Florian Lamml <info@florian-lamml.de>  Tue, 20 Oct 2026 15:00:00 +0200
 
