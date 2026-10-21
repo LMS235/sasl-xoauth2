@@ -68,7 +68,7 @@ sasl-xoauth2 (0.29) unstable; urgency=medium
     the tool, its helper and the installed plugin, and warns about a mix of
     versions; the help lists the commands and the version.
 
- -- sasl-xoauth2 maintainers <noreply@users.noreply.github.com>  Tue, 20 Oct 2026 15:00:00 +0200
+ -- Florian Lamml <info@florian-lamml.de>  Tue, 20 Oct 2026 15:00:00 +0200
 
 sasl-xoauth2 (0.28) unstable; urgency=low
 
