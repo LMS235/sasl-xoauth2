@@ -1435,7 +1435,8 @@ parallel deliveries share a single token request.
   `sasl-xoauth2-refresh.service` (e.g. `systemctl --failed`, or an
   `OnFailure=` unit that notifies you).
 - **Logs:** alert on `[sasl-xoauth2] auth failed` and on `[sasl-xoauth2]
-  unable to update token file` in the mail log. The plugin logs through
+  unable to update token file` in the mail log (see [Searching the
+  Logs](#searching-the-logs)). The plugin logs through
   Postfix's syslog connection; if Postfix writes its own log file
   (`maillog_file`), look for the plugin's messages in the system log
   (`journalctl`) instead.
@@ -1564,6 +1565,77 @@ token request fails),
 and to see successful authentications as well, `always_log_to_syslog`.
 Changes take effect when Postfix restarts its `smtp` processes (`postfix
 reload`).
+
+### Searching the Logs
+
+On Ubuntu 26.04, Postfix logs to the systemd journal, under the unit
+`postfix.service`. The plugin's messages (`[sasl-xoauth2] ...`) are there as
+well, as the plugin runs inside Postfix's processes. Reading the system
+journal needs `sudo` (or membership in the `adm` or `systemd-journal` group).
+
+Follow the log live, e.g. while sending a test mail:
+
+```
+$ sudo journalctl -u postfix -f
+```
+
+Search for keywords (`-g` takes a regular expression, case-insensitive if it
+is all lowercase):
+
+```
+# everything important about TLS, authentication and delivery problems today
+$ sudo journalctl -u postfix --since today -g 'sasl-xoauth2|verification failed|untrusted|status=(deferred|bounced)|warning|error'
+
+# only the plugin's messages of the last hour
+$ sudo journalctl -u postfix --since "1 hour ago" -g 'sasl-xoauth2'
+
+# verified TLS connections (logged with smtp_tls_loglevel = 1)
+$ sudo journalctl -u postfix --since today -g 'Verified TLS'
+```
+
+Follow a single message through Postfix by its queue ID (shown in every log
+line, e.g. `4A1B2C3D5E:`, and by `sudo postqueue -p`):
+
+```
+$ sudo journalctl -u postfix -g '4A1B2C3D5E'
+```
+
+Count today's delivery results:
+
+```
+$ sudo journalctl -u postfix --since today -g 'status=' --no-pager | grep -o 'status=[a-z]*' | sort | uniq -c
+```
+
+Show only warnings and errors:
+
+```
+$ sudo journalctl -u postfix -p warning --since today
+```
+
+Check the [daily token refresh](#daily-token-refresh):
+
+```
+$ sudo journalctl -u sasl-xoauth2-refresh.service --since "2 days ago"
+```
+
+More options:
+
+- `--since` and `--until` also take times such as `"2026-10-21 08:00"` or
+  `yesterday`.
+- `--no-pager` prints straight to the terminal (for `grep` or copying);
+  `-o short-iso` shows ISO timestamps.
+- If `-u postfix` shows nothing (e.g. for Postfix instances started via
+  `postfix@.service`), select all mail messages by their syslog facility
+  instead, which includes the plugin's:
+
+  ```
+  $ sudo journalctl SYSLOG_FACILITY=2 --since today
+  ```
+- If `rsyslog` is installed, the same messages are also in `/var/log/mail.log`,
+  e.g. `sudo grep -E 'sasl-xoauth2|status=deferred' /var/log/mail.log`.
+
+The most common messages are explained in [Troubleshooting Microsoft
+365](#troubleshooting-microsoft-365).
 
 ### Postfix Logging
 
