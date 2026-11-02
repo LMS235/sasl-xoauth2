@@ -95,19 +95,38 @@ class FileLock {
   // the mail system can still use it.
   bool Acquire(Log *log, const std::string &path,
                const std::string &owner_path) {
-    fd_ = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    // flock() works on read-only descriptors too, e.g. for a lock file that
-    // another user created.
-    if (fd_ < 0 && errno == EACCES)
-      fd_ = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    // Create the lock file exclusively: only a file this process has just
+    // created is ever handed to another owner. (Changing the owner of an
+    // existing file would let whoever can write to the token directory make
+    // root give them any file, via a hard link.)
+    bool created = true;
+    fd_ = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+               0600);
+    if (fd_ < 0 && errno == EEXIST) {
+      created = false;
+      fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+      // flock() works on read-only descriptors too, e.g. for a lock file that
+      // another user created.
+      if (fd_ < 0 && errno == EACCES)
+        fd_ =
+            open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    }
     if (fd_ < 0) {
       log->Write("FileLock: unable to open %s: %s", path.c_str(),
                  strerror(errno));
       return false;
     }
-    struct stat lock_st = {}, owner_st = {};
-    if (geteuid() == 0 && fstat(fd_, &lock_st) == 0 &&
-        stat(owner_path.c_str(), &owner_st) == 0 &&
+    struct stat lock_st = {};
+    if (fstat(fd_, &lock_st) != 0 || !S_ISREG(lock_st.st_mode) ||
+        lock_st.st_nlink != 1) {
+      log->Write("FileLock: %s is not a plain file; not using it",
+                 path.c_str());
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    struct stat owner_st = {};
+    if (created && geteuid() == 0 && stat(owner_path.c_str(), &owner_st) == 0 &&
         (lock_st.st_uid != owner_st.st_uid ||
          lock_st.st_gid != owner_st.st_gid) &&
         fchown(fd_, owner_st.st_uid, owner_st.st_gid) != 0) {

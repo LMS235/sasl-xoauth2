@@ -5,6 +5,11 @@ sasl-xoauth2 (0.29) unstable; urgency=medium
     used to be created according to the umask, usually world-readable);
     write token files atomically and durably, never leaving a partial file;
     when written by root, token and lock files keep their owner.
+  * Run as root, test-config (and so refresh-token and test-token-refresh)
+    acts as the owner of the token directory once the configuration is
+    read; the plugin and the tool never change the owner of an existing lock
+    file and refuse lock files that are not plain, singly linked files (a
+    hard link planted there could otherwise make root hand over any file).
   * Token requests: URL-encode all parameters, only use HTTPS, do not follow
     redirects, require TLS 1.2, time out (10s connect, 30s total), limit
     the response size.

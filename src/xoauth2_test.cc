@@ -1472,6 +1472,40 @@ bool TestRootKeepsTokenFileOwner() {
   return true;
 }
 
+// Whoever can write to the token directory may plant a hard link to another
+// file as the lock file. A refresh running as root must not hand that file
+// over to the token file's owner.
+bool TestRootDoesNotChownPlantedLockFile() {
+  PrintTestName(__func__);
+  if (geteuid() != 0) {
+    fprintf(stderr, "not running as root, skipping\n");
+    return true;
+  }
+  SetPasswordToTokenFile(TokenFileExpiringIn(3600));
+  TEST_ASSERT(chown(s_password.c_str(), 65534, 65534) == 0);
+  const std::string victim = s_password + ".victim";
+  s_cleanup_files.push_back(victim);
+  {
+    std::ofstream f(victim);
+    f << "root only";
+  }
+  TEST_ASSERT(chmod(victim.c_str(), 0600) == 0);
+  TEST_ASSERT(link(victim.c_str(), (s_password + ".lock").c_str()) == 0);
+
+  FakeTokenEndpoint endpoint;
+  endpoint.Install();
+  auto log = sasl_xoauth2::Log::Create();
+  auto store = sasl_xoauth2::TokenStore::Create(log.get(), s_password);
+  TEST_ASSERT(store != nullptr);
+  TEST_ASSERT_OK(store->Refresh());
+
+  struct stat st = {};
+  TEST_ASSERT(stat(victim.c_str(), &st) == 0);
+  TEST_ASSERT(st.st_uid == 0 && st.st_gid == 0);
+  TEST_ASSERT((st.st_mode & 0777) == 0600);
+  return true;
+}
+
 bool TestWriteFailureReported() {
   PrintTestName(__func__);
   SetPasswordToExpiredToken();
@@ -1554,6 +1588,7 @@ int main(int argc, char **argv) {
   TEST_ABORT(TestTokenLifetimeHandling());
   TEST_ABORT(TestClientCredentialsWithCertificate());
   TEST_ABORT(TestRootKeepsTokenFileOwner());
+  TEST_ABORT(TestRootDoesNotChownPlantedLockFile());
   TEST_ABORT(TestWriteFailureReported());
 
   Cleanup();
