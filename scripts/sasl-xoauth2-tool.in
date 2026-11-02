@@ -90,21 +90,35 @@ def open_token_lock(output_filename:str) -> Optional[int]:
     """Takes the lock the plugin takes while refreshing (<token file>.lock), so
     that a token update and a plugin refresh cannot overwrite each other."""
     lock_path = output_filename + '.lock'
+    created = True
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        # Create it exclusively: only a lock file created here is ever given
+        # to another owner. (Changing the owner of an existing file would let
+        # whoever can write to the token directory make root give them any
+        # file, via a hard link.)
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except FileExistsError:
+            created = False
+            fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     except OSError as e:
         print(f"Warning: cannot open lock file {lock_path}: {e}", file=sys.stderr)
         return None
-    # A lock file created here (e.g. by root) must stay usable for the plugin:
-    # give it the owner of the token file, or of its directory.
-    try:
-        owner = os.lstat(output_filename) if os.path.lexists(output_filename) else \
-            os.stat(os.path.dirname(os.path.abspath(output_filename)))
-        st = os.fstat(fd)
-        if (st.st_uid, st.st_gid) != (owner.st_uid, owner.st_gid):
-            os.fchown(fd, owner.st_uid, owner.st_gid)
-    except OSError:
-        pass
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        print(f"Warning: {lock_path} is not a plain file; not using it", file=sys.stderr)
+        os.close(fd)
+        return None
+    if created:
+        # A lock file created here (e.g. by root) must stay usable for the
+        # plugin: give it the owner of the token file, or of its directory.
+        try:
+            owner = os.lstat(output_filename) if os.path.lexists(output_filename) else \
+                os.stat(os.path.dirname(os.path.abspath(output_filename)))
+            if (st.st_uid, st.st_gid) != (owner.st_uid, owner.st_gid):
+                os.fchown(fd, owner.st_uid, owner.st_gid)
+        except OSError:
+            pass
     fcntl.flock(fd, fcntl.LOCK_EX)
     return fd
 
@@ -798,8 +812,8 @@ sp_refresh_token = subparse.add_parser(
                 'refresh tokens that expire when unused (Microsoft: 90 days) alive even when no '
                 'mail is sent, and checks the setup like test-token-refresh. Exit status: 0 on '
                 'success, 1 on a transient failure, 2 on a failure that needs action (the highest '
-                'status if several files are given). Token files keep their owner, also when run '
-                'as root; preferably run it as the user the mail system runs as.')
+                'status if several files are given). When run as root, it acts as the owner of the '
+                'token directory (normally the mail system\'s user); preferably run it as that user.')
 sp_refresh_token.set_defaults(func=subcommand_refresh_token)
 sp_refresh_token.add_argument(
     '--config-file',

@@ -1,8 +1,10 @@
 #include <errno.h>
 #include <getopt.h>
+#include <grp.h>
 #include <libgen.h>
 #include <sasl/sasl.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <vector>
@@ -69,25 +71,28 @@ bool TryParseCommandLine(int argc, char **argv, Options *out) {
 }
 
 void PrintUsage(const std::string &base_name) {
-  fprintf(stderr,
-          "Usage: %s [options]\n\n"
-          "Options:\n"
-          "  -c, --config=<file>  use <file> for configuration rather than\n"
-          "                       system default\n"
-          "  -r, --token=<file>   attempt to request a token from the OAuth\n"
-          "                       provider using the token file <file> (which\n"
-          "                       is not modified, unless --update is given)\n"
-          "  -u, --update         with --token: store the new token in the\n"
-          "                       token file (also renews a rotating refresh\n"
-          "                       token, e.g. Microsoft's); for a scheduled\n"
-          "                       daily refresh\n"
-          "  -V, -v, --version    print the version and exit\n"
-          "  -h, --help           print this help and exit\n\n"
-          "Exit status: 0 on success, 1 on a transient failure (e.g. network\n"
-          "problem or provider outage), 2 on a failure that needs action\n"
-          "(e.g. invalid configuration, rejected token, unwritable token\n"
-          "directory).\n",
-          base_name.c_str());
+  fprintf(
+      stderr,
+      "Usage: %s [options]\n\n"
+      "Options:\n"
+      "  -c, --config=<file>  use <file> for configuration rather than\n"
+      "                       system default\n"
+      "  -r, --token=<file>   attempt to request a token from the OAuth\n"
+      "                       provider using the token file <file> (which\n"
+      "                       is not modified, unless --update is given)\n"
+      "  -u, --update         with --token: store the new token in the\n"
+      "                       token file (also renews a rotating refresh\n"
+      "                       token, e.g. Microsoft's); for a scheduled\n"
+      "                       daily refresh\n"
+      "  -V, -v, --version    print the version and exit\n"
+      "  -h, --help           print this help and exit\n\n"
+      "Run as root, it acts as the owner of the token file's directory\n"
+      "(normally the mail system's user) once the configuration is read.\n\n"
+      "Exit status: 0 on success, 1 on a transient failure (e.g. network\n"
+      "problem or provider outage), 2 on a failure that needs action\n"
+      "(e.g. invalid configuration, rejected token, unwritable token\n"
+      "directory).\n",
+      base_name.c_str());
 }
 
 Options ParseCommandLine(int argc, char **argv) {
@@ -121,6 +126,26 @@ bool CheckTokenDirectoryWritable(const std::string &token_path) {
   return false;
 }
 
+// Run as root (e.g. from a timer) on a token directory that belongs to
+// another user (normally the mail system's), become that user before
+// touching anything in it: whoever can write there could otherwise plant
+// links that make root read, block on, or hand over other files.
+bool DropPrivilegesToTokenDirectoryOwner(const std::string &token_path) {
+  if (geteuid() != 0) return true;
+  std::vector<char> buf(token_path.begin(), token_path.end());
+  buf.push_back('\0');
+  const std::string dir = dirname(buf.data());
+  struct stat st = {};
+  if (stat(dir.c_str(), &st) != 0 || st.st_uid == 0) return true;
+  if (setgroups(0, nullptr) != 0 || setgid(st.st_gid) != 0 ||
+      setuid(st.st_uid) != 0 || setuid(0) == 0) {
+    printf("Unable to switch to the owner (uid %u) of %s: %s\n",
+           static_cast<unsigned>(st.st_uid), dir.c_str(), strerror(errno));
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -134,6 +159,9 @@ int main(int argc, char **argv) {
   printf("Config check passed.\n");
 
   if (!options.token_path.empty()) {
+    // The configuration has been read (it may be readable by root only).
+    if (!DropPrivilegesToTokenDirectoryOwner(options.token_path))
+      return kExitPermanent;
     auto logger = sasl_xoauth2::Log::Create(
         sasl_xoauth2::Log::OPTIONS_FULL_TRACE_ON_FAILURE,
         sasl_xoauth2::Log::TARGET_STDERR);

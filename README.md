@@ -238,14 +238,22 @@ upgrading from 0.28 or earlier, in addition to the steps above:
    installed the configuration world-readable:
 
    ```
-   $ sudo chown -R postfix:postfix /etc/tokens
+   $ sudo chown postfix:postfix /etc/tokens
    $ sudo chmod 700 /etc/tokens
-   $ sudo find /etc/tokens -type f -exec chmod 600 {} +
+   $ sudo -u postfix find /etc/tokens -type f -exec chmod 600 {} +
+   $ sudo find /etc/tokens ! -user postfix -ls
    $ sudo chown root:postfix /etc/sasl-xoauth2.conf
    $ sudo chmod 640 /etc/sasl-xoauth2.conf
    ```
 
-   (With chroot, the token files are below `/var/spool/postfix/etc/tokens`.)
+   The `chmod` runs as `postfix`, and nothing in the directory is changed
+   recursively as root: the Postfix user can write to it, and a recursive
+   command run as root could be tricked (with links planted there) into
+   changing other files. The `find ... -ls` lists files that do not belong to
+   `postfix` (e.g. created by an earlier `sasl-xoauth2-tool` run as root);
+   check each and give it to `postfix` individually (`sudo chown
+   postfix:postfix FILE`). (With chroot, the token files are below
+   `/var/spool/postfix/etc/tokens`.)
 1. **Require verified TLS** to the relay (see [Configure Mail
    Agent](#configure-mail-agent)): change `smtp_tls_security_level =
    encrypt` (or `may`) to `secure`, add `smtp_tls_secure_cert_match =
@@ -572,14 +580,16 @@ Postfix user:
 
 ```
 $ sudo mkdir -p /etc/tokens
-$ sudo chown -R postfix:postfix /etc/tokens
+$ sudo chown postfix:postfix /etc/tokens
 $ sudo chmod 700 /etc/tokens
-$ sudo find /etc/tokens -type f -exec chmod 600 {} +
+$ sudo -u postfix find /etc/tokens -type f -exec chmod 600 {} +
 ```
 
-or, with chroot, the same for `/var/spool/postfix/etc/tokens`. (`find` rather
-than `chmod 600 /etc/tokens/*`: once the directory belongs to `postfix`, the
-`*` cannot be expanded by an unprivileged shell.)
+or, with chroot, the same for `/var/spool/postfix/etc/tokens`. A file you put
+there as root (e.g. a copied token file) needs `sudo chown postfix:postfix
+FILE` first. Avoid recursive commands as root (`chown -R`, `find ... -exec`)
+in a directory the Postfix user can write to: links planted there could make
+them change other files.
 
 The easiest way to get ownership right is to run `sasl-xoauth2-tool` as the
 Postfix user, e.g. `sudo -u postfix sasl-xoauth2-tool get-token ...`; the
@@ -1456,9 +1466,11 @@ token is still valid. Run once a day, it
   endpoint, file permissions -- and fails with exit status 2 (needs action) or
   1 (transient) and the reason, like `test-token-refresh`.
 
-Token files keep their owner and permissions, also if it runs as root. A
-systemd timer, with the same file system restrictions as Postfix on Ubuntu
-26.04:
+Run as root, it switches to the owner of the token directory (normally
+`postfix`) before touching any token file, so files keep their owner and a
+root-run refresh cannot be tricked by links planted in the directory. Running
+it as the Postfix user directly, as below, is preferable. A systemd timer,
+with the same file system restrictions as Postfix on Ubuntu 26.04:
 
 ```
 # /etc/systemd/system/sasl-xoauth2-refresh.service
